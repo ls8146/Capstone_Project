@@ -1,0 +1,4131 @@
+---
+title: "ODOT Safety Analysis"
+format: html
+editor: visual
+---
+
+## Running Code
+
+When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
+
+```{r}
+library(sf)
+library(leaflet)
+library(tidyverse)
+setwd("~/2025 - 2026 XU/project")
+
+### Read Road_inventory
+
+road_inventory <- st_read("Road_Inventory.gdb", layer = "RoadInventory")
+
+### Reading and combining Crash Data
+
+Crash2020 <- read.csv("crashes/2020Crash.csv")
+Crash2021 <- read.csv("crashes/2021Crash.csv")
+Crash2022 <- read.csv("crashes/2022Crash.csv")
+Crash2023 <- read.csv("crashes/2023Crash.csv")
+Crash2024 <- read.csv("crashes/2024Crash.csv")
+
+crashes_all <- rbind(
+  Crash2020,
+  Crash2021,
+  Crash2022,
+  Crash2023,
+  Crash2024
+)
+
+### Read in Projects
+
+All_Projects <- read.csv("All_Projects.csv")
+head(All_Projects)
+
+### Reading in PCR
+
+st_layers("PCR_Local.gdb")
+PCR_Local <- st_read("PCR_Local.gdb", layer = "PCR_Local")
+
+st_layers("PCR_State.gdb")
+PCR_State <- st_read("PCR_State.gdb", layer = "PCRState")
+
+# Original ID columns list
+id_cols <- c("PCR_HISTORY_ID", "ROUTE_NBR", "ROUTE_SUFFIX", "NLFID", "COUNTY_CD",
+             "JURISDICTION", "ROUTE_TYPE", "DIRECTION_CD", "LEFT_MUNI_NAME", 
+             "CITY_NAME", "LEFT_TWP_NAME", "TOWNSHIP_NAME")
+
+# Keep only columns that exist in the dataframe
+id_cols_exist <- intersect(id_cols, colnames(PCR_Local))
+
+# Function to safely convert character to numeric except ID columns
+make_numeric_safe <- function(df, exclude_cols = id_cols_exist) {
+  df %>%
+    mutate(across(.cols = where(is.character) & !all_of(exclude_cols), 
+                  ~ suppressWarnings(as.numeric(.))))
+}
+
+# Apply to both datasets
+PCR_Local_fixed <- make_numeric_safe(PCR_Local)
+PCR_State_fixed <- make_numeric_safe(PCR_State)
+
+PCR_combined <- bind_rows(
+  PCR_Local_fixed %>% mutate(Source = "Local"),
+  PCR_State_fixed %>% mutate(Source = "State")
+)
+
+#write.csv(crashes_all, "crashes_all.csv", row.names = FALSE)
+#write.csv(PCR_combined, "PCR_combined.csv", row.names = FALSE)
+#write.csv(road_inventory, "road_inventory.csv", row.names = FALSE)
+
+head(road_inventory)
+
+
+############################################
+### BIG JOIN: CRASHES + ROAD INVENTORY + PCR
+############################################
+
+### ----------------------------------------
+### 1. LOAD CORE DATASETS
+### ----------------------------------------
+
+# Crashes
+crashes <- crashes_all
+
+# PCR
+pcr <- PCR_combined
+
+### ----------------------------------------
+### 2. CONVERT CRASHES TO SPATIAL FEATURES
+### ----------------------------------------
+
+# Convert crash table to sf points using lat/long
+crashes_sf <- st_as_sf(
+  crashes,
+  coords = c("ODOT_LONGITUDE_NBR", "ODOT_LATITUDE_NBR"),
+  crs = 4326,
+  remove = FALSE
+)
+
+# Check CRS consistency
+st_crs(crashes_sf)
+st_crs(road_inventory)
+
+# Project crashes to match road inventory CRS (EPSG:3857)
+crashes_sf <- st_transform(crashes_sf, 3857)
+
+# Drop Z/M dimensions (required for GEOS spatial joins)
+crashes_sf <- st_zm(crashes_sf, drop = TRUE, what = "ZM")
+road_inventory <- st_zm(road_inventory, drop = TRUE, what = "ZM")
+
+### ----------------------------------------
+### 3. SPATIAL JOIN: CRASHES → ROAD SEGMENTS
+### ----------------------------------------
+
+# Match each crash to its nearest road inventory segment
+crash_segment <- st_join(
+  crashes_sf,
+  road_inventory,
+  join = st_nearest_feature
+)
+
+# Quick sanity check
+head(crash_segment)
+
+# Optional export
+#write.csv(crash_segment, "crash_segment.csv", row.names = FALSE)
+
+### ----------------------------------------
+### 4. AGGREGATE CRASHES TO SEGMENT LEVEL
+### ----------------------------------------
+
+# Collapse crash-level data into one row per road segment
+segment_crash_summary <- crash_segment %>%
+  st_drop_geometry() %>%
+  group_by(ROADWAY_INVENTORY_ID) %>%
+  summarise(
+    total_crashes = n(),
+    fatal_crashes = sum(CRASH_SEVERITY_CD == 1, na.rm = TRUE),
+    serious_injury_crashes = sum(CRASH_SEVERITY_CD == 2, na.rm = TRUE),
+    injury_crashes = sum(CRASH_SEVERITY_CD %in% 1:4, na.rm = TRUE)
+  )
+
+# Optional export
+# write.csv(crash_segment, "crash_segment.csv", row.names = FALSE)
+
+
+### ----------------------------------------
+### 5. JOIN CRASH COUNTS BACK TO ROAD NETWORK
+### ----------------------------------------
+road_with_crashes <- road_inventory %>%
+  left_join(
+    segment_crash_summary,
+    by = "ROADWAY_INVENTORY_ID"
+  )
+
+road_with_crashes <- road_with_crashes %>%
+  mutate(
+    total_crashes = replace_na(total_crashes, 0),
+    fatal_crashes = replace_na(fatal_crashes, 0),
+    serious_injury_crashes = replace_na(serious_injury_crashes, 0),
+    injury_crashes = replace_na(injury_crashes, 0)
+  )
+
+
+### ----------------------------------------
+### 6. PREPARE PCR DATA (LATEST PER SEGMENT)
+### ----------------------------------------
+
+# Drop geometry for attribute join
+PCR_df <- st_drop_geometry(PCR_combined)
+class(PCR_df)
+
+# Align key name with road inventory
+PCR_df <- PCR_df %>%
+  rename(NLF_ID = NLFID)
+
+# Keep only the most recent PCR observation per segment
+PCR_latest <- PCR_df %>%
+  group_by(NLF_ID) %>%
+  slice_max(order_by = PCR_YEAR, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+
+### ----------------------------------------
+### 7. JOIN PCR DATA TO ROAD + CRASH DATA
+### ----------------------------------------
+
+final_sf <- road_with_crashes %>%
+  left_join(
+    PCR_latest,
+    by = "NLF_ID"
+  )
+
+# Verify row count preserved (1 row per segment)
+nrow(final_sf) == nrow(road_with_crashes)
+
+
+### ----------------------------------------
+### 8. COMPUTE CRASH RATES
+### ----------------------------------------
+
+# Crashes per mile
+final_sf <- final_sf %>%
+  mutate(
+    crashes_per_mile = total_crashes / SEGMENT_LENGTH_NBR
+  )
+
+# Million Vehicle Miles Traveled (MVMT) and crash rate
+final_sf <- final_sf %>%
+  mutate(
+    MVMT = (AADT_TOTAL * 365 * SEGMENT_LENGTH_NBR) / 1e6,
+    crashes_per_MVMT = total_crashes / MVMT
+  )
+
+
+### ----------------------------------------
+### 9. SANITY CHECKS
+### ----------------------------------------
+
+summary(final_sf$total_crashes)
+summary(final_sf$crashes_per_mile)
+summary(final_sf$crashes_per_MVMT)
+
+sum(is.infinite(final_sf$crashes_per_MVMT))
+
+segment_crash_summary <- crash_segment %>%
+  st_drop_geometry() %>%
+  group_by(ROADWAY_INVENTORY_ID) %>%
+  summarise(
+    total_crashes = n(),
+    fatal_crashes = sum(CRASH_SEVERITY_TXT == "Fatal", na.rm = TRUE),
+    injury_crashes = sum(CRASH_SEVERITY_CD %in% c(2,3,4), na.rm = TRUE),
+    .groups = "drop"
+  )
+
+road_with_crashes <- road_inventory %>%
+  left_join(segment_crash_summary, by = "ROADWAY_INVENTORY_ID") %>%
+  mutate(
+    total_crashes = replace_na(total_crashes, 0),
+    fatal_crashes = replace_na(fatal_crashes, 0),
+    injury_crashes = replace_na(injury_crashes, 0)
+  )
+
+road_with_crashes <- road_with_crashes %>%
+  mutate(
+    crashes_per_mile = total_crashes / SEGMENT_LENGTH_NBR,
+    crashes_per_MVMT = (total_crashes * 1e6) /
+      (ADT_TOTAL_NBR * 365 * SEGMENT_LENGTH_NBR)
+  )
+
+
+### ----------------------------------------
+### 10. EXPORT FINAL DATASET
+### ----------------------------------------
+
+final_sf <- road_with_crashes %>%
+  left_join(PCR_latest, by = "NLF_ID")
+
+
+#Sanity Checks
+summary(road_with_crashes$crashes_per_mile)
+summary(road_with_crashes$crashes_per_MVMT)
+
+sum(is.na(road_with_crashes$crashes_per_MVMT))
+sum(is.infinite(road_with_crashes$crashes_per_MVMT))
+
+##write.csv(final_sf, "final_sf", row.names = FALSE)
+
+##write.csv(
+  #final_sf[1:25000, ],
+  #"final_sf_first_25k.csv",
+ # row.names = FALSE
+#)
+
+############################################
+### ANALYSIS-READY SUBSET
+############################################
+
+analysis_df <- final_sf %>%
+  filter(
+    !is.na(ADT_TOTAL_NBR),
+    ADT_TOTAL_NBR > 0,
+    SEGMENT_LENGTH_NBR > 0
+  )
+
+
+library(lubridate)
+
+projects_filtered <- All_Projects %>%
+  mutate(
+    END_CONSTR_MILESTONE_DT = as.Date(END_CONSTR_MILESTONE_DT)
+  ) %>%
+  filter(
+    !is.na(END_CONSTR_MILESTONE_DT),
+    year(END_CONSTR_MILESTONE_DT) >= 2021,
+    year(END_CONSTR_MILESTONE_DT) <= 2023
+  )
+
+nrow(projects_filtered)
+
+temp_join <- analysis_df %>%
+  inner_join(projects_filtered, by = "NLF_ID")
+
+names(temp_join)
+
+treated_segments <- temp_join %>%
+  filter(
+    CTL_BEGIN_NBR <= CTL_END.y,
+    CTL_END_NBR >= CTL_BEGIN.y
+  )
+
+nrow(treated_segments)
+
+treated_ids <- treated_segments %>%
+  distinct(ROADWAY_INVENTORY_ID)
+
+nrow(treated_ids)
+
+analysis_df <- analysis_df %>%
+  mutate(
+    treated = ROADWAY_INVENTORY_ID %in% treated_ids$ROADWAY_INVENTORY_ID
+  )
+table(analysis_df$treated)
+
+summary(as.Date(treated_segments$END_CONSTR_MILESTONE_DT))
+```
+
+```{r}
+############################################
+### yearly crash rates per segment
+############################################
+
+segment_year_crashes <- crash_segment %>%
+  st_drop_geometry() %>%
+  group_by(ROADWAY_INVENTORY_ID, CRASH_YR) %>%
+  summarise(
+    yearly_crashes = n(),
+    yearly_fatal = sum(CRASH_SEVERITY_CD == 1, na.rm = TRUE),
+    yearly_injury = sum(CRASH_SEVERITY_CD %in% c(2,3,4), na.rm = TRUE),
+    .groups = "drop"
+  )
+
+head(segment_year_crashes)
+
+segment_year_data <- segment_year_crashes %>%
+  left_join(
+    analysis_df %>%
+      st_drop_geometry() %>%
+      select(ROADWAY_INVENTORY_ID,
+             SEGMENT_LENGTH_NBR,
+             ADT_TOTAL_NBR),
+    by = "ROADWAY_INVENTORY_ID"
+  )
+
+segment_year_data <- segment_year_data %>%
+  mutate(
+    MVMT = (ADT_TOTAL_NBR * 365 * SEGMENT_LENGTH_NBR) / 1e6,
+    crash_rate_MVMT = yearly_crashes / MVMT
+  )
+
+summary(segment_year_data$crash_rate_MVMT)
+
+segment_year_data <- segment_year_data %>%
+  mutate(
+    period = case_when(
+      CRASH_YR %in% c(2020, 2021) ~ "before",
+      CRASH_YR %in% c(2023, 2024) ~ "after",
+      TRUE ~ "transition"
+    )
+  )
+
+segment_year_data <- segment_year_data %>%
+  filter(period != "transition")
+
+table(segment_year_data$CRASH_YR)
+
+treated_ids <- treated_segments %>%
+  distinct(ROADWAY_INVENTORY_ID)
+
+segment_year_data <- segment_year_data %>%
+  mutate(
+    treated = ROADWAY_INVENTORY_ID %in% treated_ids$ROADWAY_INVENTORY_ID
+  )
+
+table(segment_year_data$treated)
+
+did_summary <- segment_year_data %>%
+  group_by(treated, period) %>%
+  summarise(
+    avg_crash_rate = mean(crash_rate_MVMT, na.rm = TRUE),
+    median_crash_rate = median(crash_rate_MVMT, na.rm = TRUE),
+    observations = n(),
+    .groups = "drop"
+  )
+
+did_summary
+
+did_effect <- did_summary %>%
+  select(treated, period, avg_crash_rate) %>%
+  tidyr::pivot_wider(
+    names_from = period,
+    values_from = avg_crash_rate
+  ) %>%
+  mutate(
+    change = after - before
+  )
+
+did_effect
+
+### did_effect: 1.37 based on this sample of 2021–2023 projects, treated 
+## segments did not show greater crash reduction than untreated segments.
+
+```
+
+You can add options to executable code like this
+
+```{r}
+############################################
+### Projects using Safety Funds
+############################################
+
+
+
+projects_safety <- projects_filtered %>%
+  filter(SAFETY_FUNDS_IND == "Y")
+
+nrow(projects_safety)
+
+treated_safety_segments <- analysis_df %>%
+  inner_join(projects_safety, by = "NLF_ID") %>%
+  filter(
+    CTL_BEGIN_NBR <= CTL_END.y,
+    CTL_END_NBR >= CTL_BEGIN.y
+  )
+
+treated_safety_ids <- treated_safety_segments %>%
+  distinct(ROADWAY_INVENTORY_ID)
+
+segment_year_data <- segment_year_data %>%
+  mutate(
+    treated_safety =
+      ROADWAY_INVENTORY_ID %in%
+      treated_safety_ids$ROADWAY_INVENTORY_ID
+  )
+
+table(segment_year_data$treated_safety)
+
+did_summary_safety <- segment_year_data %>%
+  group_by(treated_safety, period) %>%
+  summarise(
+    avg_crash_rate = mean(crash_rate_MVMT, na.rm = TRUE),
+    median_crash_rate = median(crash_rate_MVMT, na.rm = TRUE),
+    observations = n(),
+    .groups = "drop"
+  )
+
+did_effect_safety <- did_summary_safety %>%
+  select(treated_safety, period, avg_crash_rate) %>%
+  tidyr::pivot_wider(
+    names_from = period,
+    values_from = avg_crash_rate
+  ) %>%
+  mutate(
+    change = after - before
+  )
+
+did_safety_effect_value <-
+  did_effect_safety$change[did_effect_safety$treated_safety == TRUE] -
+  did_effect_safety$change[did_effect_safety$treated_safety == FALSE]
+did_safety_effect_value
+
+### also suggests that construction isnt helping and making it worse
+### raises the question do safety projects show immediate improvements, or is there a lag effect
+```
+
+```{r}
+############################################
+### Crash Rate Around Safety Project Completion
+############################################
+
+projects_safety <- projects_safety %>%
+  mutate(
+    completion_year = year(as.Date(END_CONSTR_MILESTONE_DT))
+  ) %>%
+  filter(!is.na(completion_year))
+
+treated_safety_segments <- analysis_df %>%
+  inner_join(projects_safety, by = "NLF_ID") %>%
+  filter(
+    CTL_BEGIN_NBR <= CTL_END.y,
+    CTL_END_NBR >= CTL_BEGIN.y
+  ) %>%
+  select(ROADWAY_INVENTORY_ID, completion_year) %>%
+  distinct()
+
+segment_year_data <- segment_year_data %>%
+  left_join(
+    treated_safety_segments,
+    by = "ROADWAY_INVENTORY_ID"
+  )
+
+segment_year_data <- segment_year_data %>%
+  mutate(
+    event_time = CRASH_YR - completion_year
+  )
+
+event_study_data <- segment_year_data %>%
+  filter(
+    !is.na(event_time),
+    event_time >= -2,
+    event_time <= 2
+  )
+
+event_summary <- event_study_data %>%
+  group_by(event_time) %>%
+  summarise(
+    avg_crash_rate = mean(crash_rate_MVMT, na.rm = TRUE),
+    observations = n(),
+    .groups = "drop"
+  )
+
+ggplot(event_summary, aes(x = event_time, y = avg_crash_rate)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 3) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(
+    title = "Crash Rate Around Safety Project Completion",
+    x = "Years Relative to Project Completion",
+    y = "Average Crash Rate (per MVMT)"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+############################################
+### Event Study: Treated vs Control
+############################################
+
+# segment_year_data already has completion_year and event_time from above
+# DO NOT re-join treated_safety_segments here — it was already joined
+
+event_window <- segment_year_data %>%
+  filter(
+    treated_safety == TRUE,
+    event_time >= -2,
+    event_time <= 2
+  )
+
+# For control, anchor their "event time" to the median completion year of treated projects
+median_completion_year <- median(
+  treated_safety_segments$completion_year, na.rm = TRUE
+)
+
+control_window <- segment_year_data %>%
+  filter(treated_safety == FALSE) %>%
+  mutate(
+    event_time = CRASH_YR - median_completion_year  # <-- THIS was the bug
+  ) %>%
+  filter(event_time >= -2, event_time <= 2)
+
+event_study_df <- bind_rows(
+  event_window %>% mutate(group = "Treated (Safety)"),
+  control_window %>% mutate(group = "Control")
+)
+
+event_summary <- event_study_df %>%
+  group_by(group, event_time) %>%
+  summarise(
+    avg_crash_rate = mean(crash_rate_MVMT, na.rm = TRUE),
+    n_obs = n(),
+    .groups = "drop"
+  )
+
+ggplot(event_summary, aes(x = event_time, y = avg_crash_rate, color = group)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray40") +
+  scale_x_continuous(breaks = -2:2) +
+  scale_y_continuous(
+    limits = c(0, 20),
+    breaks = 5:18
+  ) +
+  labs(
+    title = "Event Study: Crash Rate Around Safety Project Completion",
+    subtitle = "t = 0 is the year construction completed",
+    x = "Years Relative to Project Completion",
+    y = "Average Crash Rate (per MVMT)",
+    color = "Group"
+  ) +
+  theme_minimal()
+
+library(lfe)
+
+did_model <- felm(
+  crash_rate_MVMT ~ treated_safety * I(period == "after") |
+    ROADWAY_INVENTORY_ID + CRASH_YR |
+    0 |
+    ROADWAY_INVENTORY_ID,
+  data = segment_year_data
+)
+summary(did_model)
+
+#Safety-funded segments showed essentially zero additional change in crash rate compared to control segments
+#The effect is statistically indistinguishable from zero
+#This confirms your raw DiD finding
+
+# Keep only segments observed in BOTH before and after periods
+balanced_segments <- segment_year_data %>%
+  group_by(ROADWAY_INVENTORY_ID) %>%
+  filter(all(c("before", "after") %in% period)) %>%
+  ungroup()
+
+nrow(balanced_segments)  # check how many remain
+
+did_model_balanced <- felm(
+  crash_rate_MVMT ~ treated_safety * I(period == "after") |
+    ROADWAY_INVENTORY_ID + CRASH_YR |
+    0 |
+    ROADWAY_INVENTORY_ID,
+  data = balanced_segments
+)
+
+summary(did_model_balanced)
+
+### no noticable changes
+
+# Clean event study - treated segments only, no re-joining
+# Clean event study - treated segments only, no re-joining
+event_summary <- segment_year_data %>%
+  filter(
+    treated_safety == TRUE,
+    !is.na(event_time),
+    event_time >= -2,
+    event_time <= 2
+  ) %>%
+  group_by(event_time) %>%
+  summarise(
+    avg_crash_rate = mean(crash_rate_MVMT, na.rm = TRUE),
+    se = sd(crash_rate_MVMT, na.rm = TRUE) / sqrt(n()),
+    n_obs = n(),
+    .groups = "drop"
+  )
+
+print(event_summary)
+
+ggplot(event_summary, aes(x = event_time, y = avg_crash_rate)) +
+  geom_ribbon(aes(ymin = avg_crash_rate - 1.96*se,
+                  ymax = avg_crash_rate + 1.96*se),
+              alpha = 0.2, fill = "steelblue") +
+  geom_line(linewidth = 1.2, color = "steelblue") +
+  geom_point(size = 3, color = "steelblue") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  annotate("text", x = 0.1, y = max(event_summary$avg_crash_rate),
+           label = "Construction\nComplete", hjust = 0, color = "red", size = 5.5) +
+  scale_x_continuous(breaks = -2:2) +
+  labs(
+    title = "Event Study: Crash Rates Around Safety Project Completion",
+    subtitle = "Treated segments only | t=0 is completion year",
+    x = "Years Relative to Project Completion",
+    y = "Average Crash Rate (per MVMT)"
+  ) +
+  theme_minimal()
+
+
+# Filter to only segments where construction completed in 2021
+# This gives us 3 full years of post-completion data (2022, 2023, 2024)
+
+# Filter to only segments where construction completed in 2021
+# This gives us 3 full years of post-completion data (2022, 2023, 2024)
+
+cohort_2021 <- segment_year_data %>%
+  filter(
+    treated_safety == TRUE,
+    !is.na(completion_year),
+    completion_year == 2021
+  ) %>%
+  mutate(event_time = CRASH_YR - 2021)
+
+# Check what years we have
+table(cohort_2021$CRASH_YR)
+print(paste("Number of segments:", n_distinct(cohort_2021$ROADWAY_INVENTORY_ID)))
+
+cohort_summary <- cohort_2021 %>%
+  filter(event_time >= -2, event_time <= 3) %>%  # extend to +3 for lag testing
+  group_by(event_time) %>%
+  summarise(
+    avg_crash_rate = mean(crash_rate_MVMT, na.rm = TRUE),
+    se = sd(crash_rate_MVMT, na.rm = TRUE) / sqrt(n()),
+    n_obs = n(),
+    .groups = "drop"
+  )
+
+print(cohort_summary)
+
+ggplot(cohort_summary, aes(x = event_time, y = avg_crash_rate)) +
+  geom_ribbon(aes(ymin = avg_crash_rate - 1.96*se,
+                  ymax = avg_crash_rate + 1.96*se),
+              alpha = 0.2, fill = "darkgreen") +
+  geom_line(linewidth = 1.2, color = "darkgreen") +
+  geom_point(size = 3, color = "darkgreen") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  annotate("text", x = 0.1, y = max(cohort_summary$avg_crash_rate),
+           label = "Construction\nComplete", hjust = 0, color = "red", size = 5.5) +
+  scale_x_continuous(breaks = -2:3) +
+  labs(
+    title = "2021 Cohort: Crash Rates After Safety Project Completion",
+    subtitle = "Only segments completing construction in 2021 | Extends to t=+3",
+    x = "Years Relative to Project Completion (2021)",
+    y = "Average Crash Rate (per MVMT)"
+  ) +
+  theme_minimal()
+
+
+
+# Compare baseline characteristics of treated vs control
+baseline_check <- analysis_df %>%
+  st_drop_geometry() %>%
+  mutate(
+    treated_safety = ROADWAY_INVENTORY_ID %in% treated_safety_ids$ROADWAY_INVENTORY_ID
+  ) %>%
+  group_by(treated_safety) %>%
+  summarise(
+    n_segments = n(),
+    avg_ADT = mean(ADT_TOTAL_NBR, na.rm = TRUE),
+    avg_length = mean(SEGMENT_LENGTH_NBR, na.rm = TRUE),
+    avg_crash_rate = mean(crashes_per_MVMT, na.rm = TRUE),
+    avg_PCR = mean(PCR_NBR, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(baseline_check)
+
+### Compared roads had bias so we need to reapproach
+
+# Step 1: Get the ADT range of treated segments
+treated_adt_range <- analysis_df %>%
+  st_drop_geometry() %>%
+  mutate(
+    treated_safety = ROADWAY_INVENTORY_ID %in% treated_safety_ids$ROADWAY_INVENTORY_ID
+  ) %>%
+  filter(treated_safety == TRUE) %>%
+  summarise(
+    low  = quantile(ADT_TOTAL_NBR, 0.10, na.rm = TRUE),
+    high = quantile(ADT_TOTAL_NBR, 0.90, na.rm = TRUE)
+  )
+
+print(treated_adt_range)
+# Expected output: low = 573, high = 39364
+
+# Step 2: Filter to comparable roads only
+matched_data <- segment_year_data %>%
+  filter(
+    treated_safety == TRUE |
+    (treated_safety == FALSE &
+     ADT_TOTAL_NBR >= treated_adt_range$low &
+     ADT_TOTAL_NBR <= treated_adt_range$high)
+  )
+
+table(matched_data$treated_safety)
+# Expected: FALSE ~155k, TRUE ~14k
+
+# Step 3: DiD summary on matched sample
+did_summary_matched <- matched_data %>%
+  group_by(treated_safety, period) %>%
+  summarise(
+    avg_crash_rate = mean(crash_rate_MVMT, na.rm = TRUE),
+    n_obs = n(),
+    .groups = "drop"
+  )
+
+matched_data <- segment_year_data %>%
+  filter(
+    treated_safety == TRUE |
+      (treated_safety == FALSE &
+         ADT_TOTAL_NBR >= treated_adt_range$low &
+         ADT_TOTAL_NBR <= treated_adt_range$high)
+  )
+
+table(matched_data$treated_safety)
+
+did_summary_matched <- matched_data %>%
+  group_by(treated_safety, period) %>%
+  summarise(
+    avg_crash_rate = mean(crash_rate_MVMT, na.rm = TRUE),
+    n_obs = n(),
+    .groups = "drop"
+  )
+
+print(did_summary_matched)
+
+did_plot_data <- data.frame(
+  period = c("Before", "After", "Before", "After"),
+  group = c("Control", "Control", "Treated (Safety-Funded)", "Treated (Safety-Funded)"),
+  avg_crash_rate = c(10.6, 10.3, 7.65, 7.42)
+) %>%
+  mutate(period = factor(period, levels = c("Before", "After")))
+
+ggplot(did_plot_data, aes(x = period, y = avg_crash_rate, 
+                          color = group, group = group)) +
+  geom_line(linewidth = 1.4) +
+  geom_point(size = 4) +
+  geom_label(aes(label = round(avg_crash_rate, 2)), 
+             nudge_x = 0.08, show.legend = FALSE, size = 5.5) +
+  scale_color_manual(values = c("Control" = "gray50", 
+                                "Treated (Safety-Funded)" = "steelblue")) +
+  labs(
+    title = "Difference-in-Differences: Safety Project Impact on Crash Rates",
+    subtitle = "Matched on ADT volume | DiD effect = +0.07 (not significant)",
+    x = NULL,
+    y = "Average Crash Rate (per MVMT)",
+    color = "Group"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+```
+
+```{r}
+#################################
+### Looking at PRIMARY_WORK_TYPE
+#################################
+
+# Step 1: Create projects_safety_typed
+projects_safety_typed <- projects_safety %>%
+  select(NLF_ID, CTL_BEGIN, CTL_END, completion_year, PRIMARY_WORK_CATEGORY)
+
+# Step 1: do the join first and check what columns exist
+test_join <- analysis_df %>%
+  st_drop_geometry() %>%
+  inner_join(projects_safety_typed, by = "NLF_ID", relationship = "many-to-many")
+
+# Check if CTL_BEGIN/CTL_END survived the join
+names(test_join)[grep("CTL", names(test_join))]
+
+treated_typed_segments <- analysis_df %>%
+  st_drop_geometry() %>%
+  inner_join(projects_safety_typed, by = "NLF_ID", relationship = "many-to-many") %>%
+  filter(
+    CTL_BEGIN_NBR <= CTL_END.y,
+    CTL_END_NBR >= CTL_BEGIN.y
+  ) %>%
+  select(ROADWAY_INVENTORY_ID, completion_year, PRIMARY_WORK_CATEGORY) %>%
+  distinct(ROADWAY_INVENTORY_ID, PRIMARY_WORK_CATEGORY, .keep_all = TRUE)
+
+# Check project type counts
+category_counts <- treated_typed_segments %>%
+  count(PRIMARY_WORK_CATEGORY, sort = TRUE)
+
+View(category_counts)
+
+# Categories with enough data to analyze
+key_categories <- c(
+  "Traffic Control (Safety)",
+  "Roadway Minor Rehab", 
+  "Intersection Improvement (Safety)",
+  "Roadside / Median Improvement (Safety)",
+  "Pedestrian Facilities",
+  "Pavement Treatments (Safety)"
+)
+
+# Join category info onto segment_year_data
+segment_year_typed <- segment_year_data %>%
+  left_join(
+    treated_typed_segments %>% 
+      filter(PRIMARY_WORK_CATEGORY %in% key_categories),
+    by = "ROADWAY_INVENTORY_ID"
+  ) %>%
+  mutate(
+    work_category = case_when(
+      !is.na(PRIMARY_WORK_CATEGORY) ~ PRIMARY_WORK_CATEGORY,
+      treated_safety == FALSE ~ "Control",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(work_category))
+
+# Calculate control change separately first
+control_change_val <- segment_year_typed %>%
+  filter(work_category == "Control") %>%
+  group_by(period) %>%
+  summarise(avg_crash_rate = mean(crash_rate_MVMT, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = period, values_from = avg_crash_rate) %>%
+  mutate(change = after - before) %>%
+  pull(change)
+
+cat("Control change:", control_change_val, "\n")
+
+# Now run DiD for each category
+did_by_category <- segment_year_typed %>%
+  filter(work_category %in% key_categories) %>%
+  group_by(work_category, period) %>%
+  summarise(
+    avg_crash_rate = mean(crash_rate_MVMT, na.rm = TRUE),
+    n_obs = n(),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(names_from = period, values_from = c(avg_crash_rate, n_obs)) %>%
+  mutate(
+    change = avg_crash_rate_after - avg_crash_rate_before,
+    did_effect = change - control_change_val
+  )
+
+as.data.frame(did_by_category)
+
+ggplot(did_by_category, aes(x = reorder(work_category, did_effect), 
+                            y = did_effect, 
+                            fill = did_effect < 0)) +
+  geom_col() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  geom_text(aes(label = round(did_effect, 2)), 
+            hjust = ifelse(did_by_category$did_effect < 0, 1.2, -0.2),
+            size = 4) +
+  coord_flip() +
+  scale_fill_manual(values = c("TRUE" = "steelblue", "FALSE" = "tomato"),
+                    labels = c("FALSE" = "Crash increase", "TRUE" = "Crash reduction")) +
+  labs(
+    title = "Safety Project Impact on Crash Rates by Work Category",
+    subtitle = "DiD effect vs control | Negative = crash reduction relative to control",
+    x = NULL,
+    y = "DiD Effect (crashes per MVMT vs control)",
+    fill = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+### Very interesting stuff here, basically seems to be showing me that only intersection
+### improvement projects are making things safer where as other safety projects make 
+### little changes or even make things worse. 
+```
+
+```{r}
+##################################
+### What makes roads Safer? (RF)
+##################################
+
+# Build a modeling dataset at the segment level
+# Join all the info we have onto segments that have crash rate changes
+
+# First create a before/after crash rate per segment
+segment_change <- segment_year_data %>%
+  filter(period %in% c("before", "after")) %>%
+  group_by(ROADWAY_INVENTORY_ID, period) %>%
+  summarise(
+    avg_crash_rate = mean(crash_rate_MVMT, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(names_from = period, values_from = avg_crash_rate) %>%
+  mutate(
+    crash_rate_change = after - before,
+    improved = crash_rate_change < 0  # TRUE = got safer
+  ) %>%
+  filter(!is.na(before), !is.na(after))
+
+library(randomForest)
+
+# Build clean modeling dataset
+model_df <- segment_change %>%
+  left_join(
+    analysis_df %>%
+      st_drop_geometry() %>%
+      select(
+        ROADWAY_INVENTORY_ID,
+        ADT_TOTAL_NBR,
+        SEGMENT_LENGTH_NBR,
+        FUNCTION_CLASS_CD,
+        SPEED_LIMIT_NBR,
+        MEDIAN_TYPE_CD,
+        LANES_NBR,
+        LANE_WIDTH_NBR,
+        SHOULDER_TYPE_CD,
+        SHOULDER_TOTAL_WIDTH_LT,
+        SHOULDER_TOTAL_WIDTH_RT,
+        SURFACE_TYPE_LEFT_CD,
+        AREA_TYPE,
+        DIVIDED_HWY_IND.x,
+        PCR_NBR,
+        AVG_IRI,
+        TOT_PCR_DEDUCT_NBR,
+        TOT_CRACK_DEDUCT_NBR,
+        TOT_RUT_DEDUCT_NBR,
+        RUTTING_VALUE,
+        POTHOLE_VALUE,
+        PATCHING_VALUE,
+        crashes_per_MVMT
+      ),
+    by = "ROADWAY_INVENTORY_ID"
+  ) %>%
+  left_join(
+    treated_typed_segments %>%
+      select(ROADWAY_INVENTORY_ID, PRIMARY_WORK_CATEGORY),
+    by = "ROADWAY_INVENTORY_ID"
+  ) %>%
+  mutate(
+    PRIMARY_WORK_CATEGORY = replace_na(PRIMARY_WORK_CATEGORY, "No Project"),
+    PRIMARY_WORK_CATEGORY = as.factor(PRIMARY_WORK_CATEGORY),
+    FUNCTION_CLASS_CD = as.factor(FUNCTION_CLASS_CD),
+    MEDIAN_TYPE_CD = as.factor(MEDIAN_TYPE_CD),
+    SHOULDER_TYPE_CD = as.factor(SHOULDER_TYPE_CD),
+    SURFACE_TYPE_LEFT_CD = as.factor(SURFACE_TYPE_LEFT_CD),
+    AREA_TYPE = as.factor(AREA_TYPE),
+    DIVIDED_HWY_IND.x = as.factor(DIVIDED_HWY_IND.x),
+    improved = as.factor(ifelse(crash_rate_change < 0, "Improved", "Worsened"))
+  )
+
+# Check outcome balance
+table(model_df$improved)
+
+# Check missingness
+colSums(is.na(model_df %>% select(-ROADWAY_INVENTORY_ID, -before, -after, 
+                                  -crash_rate_change)))
+
+
+# Drop high-NA columns, keep clean ones
+rf_df <- model_df %>%
+  select(
+    improved,
+    ADT_TOTAL_NBR,
+    SEGMENT_LENGTH_NBR,
+    FUNCTION_CLASS_CD,
+    SPEED_LIMIT_NBR,
+    LANES_NBR,
+    SURFACE_TYPE_LEFT_CD,
+    DIVIDED_HWY_IND.x,
+    PCR_NBR,
+    TOT_PCR_DEDUCT_NBR,
+    TOT_CRACK_DEDUCT_NBR,
+    TOT_RUT_DEDUCT_NBR,
+    crashes_per_MVMT,
+    PRIMARY_WORK_CATEGORY
+  ) %>%
+  # Drop rows with any remaining NAs
+  drop_na()
+
+# Check what's left
+nrow(rf_df)
+table(rf_df$improved)
+
+# Train random forest
+set.seed(42)
+rf_model <- randomForest(
+  improved ~ .,
+  data = rf_df,
+  ntree = 500,
+  importance = TRUE,
+  sampsize = c(Improved = 3000, Worsened = 3000)  # balance the classes
+)
+
+print(rf_model)
+
+# Extract feature importance
+importance_df <- as.data.frame(importance(rf_model)) %>%
+  rownames_to_column("Variable") %>%
+  arrange(desc(MeanDecreaseGini))
+
+# Plot
+ggplot(importance_df, aes(x = reorder(Variable, MeanDecreaseGini), 
+                          y = MeanDecreaseGini)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "What Predicts Whether a Road Segment Improves or Worsens?",
+    subtitle = "Random Forest Feature Importance (Mean Decrease Gini)",
+    x = NULL,
+    y = "Importance Score"
+  ) +
+  theme_minimal(base_size = 12)
+
+# Compare characteristics between improved and worsened segments directly
+rf_df %>%
+  group_by(improved) %>%
+  summarise(
+    avg_ADT = mean(ADT_TOTAL_NBR, na.rm = TRUE),
+    avg_speed_limit = mean(SPEED_LIMIT_NBR, na.rm = TRUE),
+    avg_PCR = mean(PCR_NBR, na.rm = TRUE),
+    avg_crack_deduct = mean(TOT_CRACK_DEDUCT_NBR, na.rm = TRUE),
+    avg_rut_deduct = mean(TOT_RUT_DEDUCT_NBR, na.rm = TRUE),
+    avg_lanes = mean(LANES_NBR, na.rm = TRUE),
+    avg_baseline_crash_rate = mean(crashes_per_MVMT, na.rm = TRUE),
+    n = n()
+  ) %>%
+  as.data.frame()
+
+# Bin segments by their baseline crash rate and see improvement rates
+rf_df %>%
+  mutate(
+    baseline_bin = cut(crashes_per_MVMT,
+                       breaks = c(0, 10, 25, 50, 100, Inf),
+                       labels = c("Very Low (0-10)", "Low (10-25)", 
+                                  "Medium (25-50)", "High (50-100)", 
+                                  "Very High (100+)"))
+  ) %>%
+  group_by(baseline_bin) %>%
+  summarise(
+    n_segments = n(),
+    pct_improved = mean(improved == "Improved") * 100,
+    avg_change = mean(as.numeric(as.character(
+      factor(improved, levels = c("Improved","Worsened"), labels = c(-1,1))
+    )), na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  as.data.frame()
+
+# Summary plot of all DiD effects including the "all projects" result
+all_effects <- did_by_category %>%
+  select(work_category, did_effect) %>%
+  bind_rows(
+    data.frame(
+      work_category = "All Safety Projects (Overall)",
+      did_effect = did_safety_effect_value
+    )
+  ) %>%
+  mutate(
+    significant = work_category == "Intersection Improvement (Safety)",
+    work_category = str_wrap(work_category, width = 30)
+  )
+
+ggplot(all_effects, aes(x = reorder(work_category, did_effect),
+                        y = did_effect,
+                        fill = did_effect < 0)) +
+  geom_col() +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_text(aes(label = round(did_effect, 2)),
+            hjust = ifelse(all_effects$did_effect < 0, 1.2, -0.2),
+            size = 5.5) +
+  coord_flip() +
+  scale_fill_manual(
+    values = c("TRUE" = "steelblue", "FALSE" = "tomato"),
+    labels = c("TRUE" = "Crash reduction", "FALSE" = "Crash increase")
+  ) +
+  labs(
+    title = "Which Safety Projects Actually Reduce Crashes?",
+    subtitle = "Difference-in-Differences effect vs matched control segments",
+    x = NULL,
+    y = "DiD Effect (crashes per MVMT)",
+    fill = NULL,
+    caption = "Negative values indicate crash reduction relative to control roads"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+
+
+
+
+### High Risk Model
+
+
+# Build a high risk indicator and profile what those segments look like
+high_risk_profile <- analysis_df %>%
+  st_drop_geometry() %>%
+  mutate(
+    high_risk = crashes_per_MVMT >= quantile(crashes_per_MVMT, 0.90, na.rm = TRUE),
+    received_safety_investment = ROADWAY_INVENTORY_ID %in% 
+      treated_safety_ids$ROADWAY_INVENTORY_ID
+  ) %>%
+  group_by(high_risk) %>%
+  summarise(
+    n_segments = n(),
+    avg_ADT = mean(ADT_TOTAL_NBR, na.rm = TRUE),
+    avg_speed_limit = mean(SPEED_LIMIT_NBR, na.rm = TRUE),
+    avg_PCR = mean(PCR_NBR, na.rm = TRUE),
+    avg_length = mean(SEGMENT_LENGTH_NBR, na.rm = TRUE),
+    avg_lanes = mean(LANES_NBR, na.rm = TRUE),
+    avg_IRI = mean(AVG_IRI, na.rm = TRUE),
+    avg_crack_deduct = mean(TOT_CRACK_DEDUCT_NBR, na.rm = TRUE),
+    avg_rut_deduct = mean(TOT_RUT_DEDUCT_NBR, na.rm = TRUE),
+    pct_received_investment = mean(received_safety_investment) * 100,
+    .groups = "drop"
+  )
+
+as.data.frame(high_risk_profile)
+
+# Also look at functional class breakdown of high risk segments
+analysis_df %>%
+  st_drop_geometry() %>%
+  mutate(high_risk = crashes_per_MVMT >= quantile(crashes_per_MVMT, 0.90, na.rm = TRUE)) %>%
+  group_by(FUNCTION_CLASS_CD, high_risk) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = high_risk, values_from = n, names_prefix = "high_risk_") %>%
+  mutate(pct_high_risk = high_risk_TRUE / (high_risk_TRUE + high_risk_FALSE) * 100) %>%
+  arrange(desc(pct_high_risk)) %>%
+  as.data.frame()
+
+
+
+
+
+
+# Build severity profile by functional class and risk level
+severity_profile <- analysis_df %>%
+  st_drop_geometry() %>%
+  mutate(
+    high_risk = crashes_per_MVMT >= quantile(crashes_per_MVMT, 0.90, na.rm = TRUE)
+  ) %>%
+  group_by(FUNCTION_CLASS_CD, high_risk) %>%
+  summarise(
+    n_segments = n(),
+    total_crashes = sum(total_crashes, na.rm = TRUE),
+    total_fatal = sum(fatal_crashes, na.rm = TRUE),
+    total_injury = sum(injury_crashes, na.rm = TRUE),
+    fatal_rate = sum(fatal_crashes) / sum(total_crashes) * 100,
+    injury_rate = sum(injury_crashes) / sum(total_crashes) * 100,
+    crashes_per_segment = mean(total_crashes, na.rm = TRUE),
+    avg_ADT = mean(ADT_TOTAL_NBR, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(FUNCTION_CLASS_CD, high_risk) %>%
+  as.data.frame()
+
+print(severity_profile)
+
+# Also get a clean high risk vs normal summary by severity
+analysis_df %>%
+  st_drop_geometry() %>%
+  mutate(
+    high_risk = crashes_per_MVMT >= quantile(crashes_per_MVMT, 0.90, na.rm = TRUE)
+  ) %>%
+  group_by(high_risk) %>%
+  summarise(
+    total_crashes = sum(total_crashes, na.rm = TRUE),
+    total_fatal = sum(fatal_crashes, na.rm = TRUE),
+    total_injury = sum(injury_crashes, na.rm = TRUE),
+    pct_of_all_fatals = NA,  # will compute below
+    fatal_rate = sum(fatal_crashes) / sum(total_crashes) * 100,
+    injury_rate = sum(injury_crashes) / sum(total_crashes) * 100,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    pct_of_all_fatals = total_fatal / sum(total_fatal) * 100,
+    pct_of_all_injuries = total_injury / sum(total_injury) * 100,
+    pct_of_all_crashes = total_crashes / sum(total_crashes) * 100
+  ) %>%
+  as.data.frame()
+```
+
+```{r}
+#############################
+### What is more dangerous? 
+#############################
+
+fc_summary <- analysis_df %>%
+  st_drop_geometry() %>%
+  group_by(FUNCTION_CLASS_CD) %>%
+  summarise(
+    n_segments = n(),
+    avg_ADT = mean(ADT_TOTAL_NBR, na.rm = TRUE),
+    total_crashes = sum(total_crashes, na.rm = TRUE),
+    total_fatal = sum(fatal_crashes, na.rm = TRUE),
+    total_injury = sum(injury_crashes, na.rm = TRUE),
+    avg_crashes_per_MVMT = round(mean(crashes_per_MVMT, na.rm = TRUE), 1),
+    fatal_rate_pct = round(sum(fatal_crashes) / sum(total_crashes) * 100, 2),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    pct_of_all_crashes = round(total_crashes / sum(total_crashes) * 100, 1),
+    pct_of_all_fatals = round(total_fatal / sum(total_fatal) * 100, 1),
+    avg_crashes_per_segment = round(total_crashes / n_segments, 1)
+  ) %>%
+  arrange(FUNCTION_CLASS_CD)
+
+as.data.frame(fc_summary)
+
+analysis_df %>%
+  st_drop_geometry() %>%
+  mutate(
+    received_safety = ROADWAY_INVENTORY_ID %in% treated_safety_ids$ROADWAY_INVENTORY_ID
+  ) %>%
+  filter(received_safety == TRUE) %>%
+  group_by(FUNCTION_CLASS_CD) %>%
+  summarise(
+    n_treated_segments = n(),
+    avg_ADT = mean(ADT_TOTAL_NBR, na.rm = TRUE),
+    avg_crashes_per_MVMT = round(mean(crashes_per_MVMT, na.rm = TRUE), 1),
+    total_fatal = sum(fatal_crashes, na.rm = TRUE),
+    fatal_rate_pct = round(sum(fatal_crashes) / sum(total_crashes) * 100, 2),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    pct_of_safety_work = round(n_treated_segments / sum(n_treated_segments) * 100, 1)
+  ) %>%
+  arrange(desc(n_treated_segments)) %>%
+  as.data.frame()
+
+# Build the investment vs need comparison directly
+investment_vs_need <- fc_summary %>%
+  left_join(
+    analysis_df %>%
+      st_drop_geometry() %>%
+      mutate(received_safety = ROADWAY_INVENTORY_ID %in% 
+               treated_safety_ids$ROADWAY_INVENTORY_ID) %>%
+      group_by(FUNCTION_CLASS_CD) %>%
+      summarise(
+        n_treated = sum(received_safety),
+        pct_treated = round(mean(received_safety) * 100, 1),
+        .groups = "drop"
+      ),
+    by = "FUNCTION_CLASS_CD"
+  ) %>%
+  mutate(
+    fc_label = case_when(
+      FUNCTION_CLASS_CD == 1 ~ "1 - Interstate",
+      FUNCTION_CLASS_CD == 2 ~ "2 - Freeway",
+      FUNCTION_CLASS_CD == 3 ~ "3 - Major Arterial",
+      FUNCTION_CLASS_CD == 4 ~ "4 - Minor Arterial",
+      FUNCTION_CLASS_CD == 5 ~ "5 - Collector",
+      FUNCTION_CLASS_CD == 6 ~ "6 - Minor Collector",
+      FUNCTION_CLASS_CD == 7 ~ "7 - Local"
+    )
+  ) %>%
+  select(fc_label, n_segments, pct_treated, avg_crashes_per_MVMT, 
+         pct_of_all_fatals, fatal_rate_pct, avg_ADT)
+
+as.data.frame(investment_vs_need)
+```
+
+```{r}
+############################################
+### Cincinnati / Hamilton County Analysis
+############################################
+
+# Check what county identifier looks like in your data
+unique(analysis_df$COUNTY_CD.x) %>% head(20)
+
+# Hamilton County code in Ohio is 31
+# Correct filter using abbreviation
+cincinnati_df <- analysis_df %>%
+  st_drop_geometry() %>%
+  filter(COUNTY_CD.x == "HAM")
+
+nrow(cincinnati_df)
+
+# Verify it worked
+head(cincinnati_df$COUNTY_CD.x)
+
+# Also filter segment_year_data to Cincinnati
+cincinnati_year <- segment_year_data %>%
+  filter(ROADWAY_INVENTORY_ID %in% cincinnati_df$ROADWAY_INVENTORY_ID)
+
+# Quick profile of Cincinnati roads
+cincinnati_df %>%
+  group_by(FUNCTION_CLASS_CD) %>%
+  summarise(
+    n_segments = n(),
+    avg_ADT = mean(ADT_TOTAL_NBR, na.rm = TRUE),
+    avg_crash_rate = mean(crashes_per_MVMT, na.rm = TRUE),
+    total_fatal = sum(fatal_crashes, na.rm = TRUE),
+    pct_treated = mean(ROADWAY_INVENTORY_ID %in% 
+                         treated_safety_ids$ROADWAY_INVENTORY_ID) * 100,
+    .groups = "drop"
+  ) %>%
+  arrange(FUNCTION_CLASS_CD) %>%
+  as.data.frame()
+
+
+
+COL_ORANGE  <- "#f0883e"
+COL_BLUE    <- "#58a6ff"
+COL_GREEN   <- "#3fb950"
+COL_RED     <- "#f85149"
+COL_YELLOW  <- "#d29922"
+COL_MUTED   <- "#8b949e"
+COL_SURFACE <- "#161b22"
+
+theme_odot <- function() {
+  theme_minimal(base_size = 12) +
+    theme(
+      plot.background    = element_rect(fill = "#0d1117", color = NA),
+      panel.background   = element_rect(fill = "#161b22", color = NA),
+      panel.grid.major   = element_line(color = "#30363d", linewidth = 0.4),
+      panel.grid.minor   = element_blank(),
+      panel.border       = element_rect(color = "#30363d", fill = NA),
+      text               = element_text(color = "#e6edf3"),
+      axis.text          = element_text(color = "#8b949e", size = 10),
+      axis.title         = element_text(color = "#e6edf3", size = 11),
+      plot.title         = element_text(color = "#e6edf3", size = 14,
+                                        face = "bold",
+                                        margin = ggplot2::margin(b = 4)),
+      plot.subtitle      = element_text(color = "#8b949e", size = 10,
+                                        margin = ggplot2::margin(b = 16)),
+      plot.caption       = element_text(color = "#8b949e", size = 9,
+                                        margin = ggplot2::margin(t = 12)),
+      legend.background  = element_rect(fill = "#161b22", color = NA),
+      legend.text        = element_text(color = "#8b949e", size = 10),
+      legend.title       = element_text(color = "#e6edf3", size = 10),
+      strip.text         = element_text(color = "#e6edf3", size = 10),
+      plot.margin        = ggplot2::margin(16, 16, 16, 16)
+    )
+}
+
+cincinnati_fc_plot <- data.frame(
+  fc_label      = factor(c("1-Interstate", "2-Freeway", "3-Major Art.",
+                           "4-Minor Art.", "5-Collector", "7-Local"),
+                         levels = c("1-Interstate", "2-Freeway", "3-Major Art.",
+                                    "4-Minor Art.", "5-Collector", "7-Local")),
+  avg_crash_rate = c(18.66, 11.88, 33.84, 37.29, 40.23, 41.23),
+  pct_treated    = c(4.78, 6.35, 14.16, 6.52, 2.18, 0.42),
+  total_fatal    = c(39, 4, 75, 69, 47, 15),
+  n_segments     = c(691, 189, 883, 966, 1146, 710)
+) %>%
+  mutate(
+    bar_color = case_when(
+      fc_label %in% c("1-Interstate", "2-Freeway") ~ COL_BLUE,
+      fc_label == "3-Major Art."                   ~ COL_YELLOW,
+      fc_label %in% c("4-Minor Art.", "5-Collector") ~ COL_RED,
+      fc_label == "7-Local"                         ~ COL_ORANGE
+    ),
+    pct_of_fatals = round(total_fatal / sum(total_fatal) * 100, 1)
+  )
+
+# ── Plot A: Investment Rate vs Crash Rate (bubble) ───────────────────────────
+p_bubble <- ggplot(cincinnati_fc_plot,
+                   aes(x = pct_treated, y = avg_crash_rate,
+                       size = pct_of_fatals, fill = bar_color)) +
+  geom_point(shape = 21, alpha = 0.85,
+             color = "#0d1117", stroke = 1.5) +
+  geom_text(aes(label = fc_label),
+            vjust = -1.5, size = 5.5, color = "#e6edf3") +
+  annotate("rect", xmin = -0.3, xmax = 4,
+           ymin = 35, ymax = 44,
+           fill = COL_RED, alpha = 0.06,
+           color = COL_RED, linetype = "dashed", linewidth = 0.4) +
+  annotate("text", x = 1.8, y = 43.5,
+           label = "High risk, low investment",
+           color = COL_RED, size = 5.0, fontface = "italic") +
+  scale_fill_identity() +
+  scale_size_continuous(range = c(5, 20),
+                        name = "% of Local Fatalities") +
+  scale_x_continuous(limits = c(-0.5, 17),
+                     labels = scales::percent_format(scale = 1)) +
+  labs(
+    title    = "Cincinnati: Investment Gap by Road Class",
+    subtitle = "Bubble size = share of Hamilton County fatalities",
+    x        = "% of Segments Receiving Safety Investment",
+    y        = "Avg Crash Rate (per MVMT)"
+  ) +
+  theme_odot() +
+  theme(legend.position = "right")
+
+p_bubble
+
+# ── Plot B: Side by side investment vs crash rate bars ───────────────────────
+p_bars <- cincinnati_fc_plot %>%
+  select(fc_label, avg_crash_rate, pct_treated) %>%
+  pivot_longer(-fc_label,
+               names_to  = "metric",
+               values_to = "value") %>%
+  mutate(metric = case_when(
+    metric == "avg_crash_rate" ~ "Avg Crash Rate per MVMT",
+    metric == "pct_treated"    ~ "% Segments Receiving Safety Work"
+  )) %>%
+  ggplot(aes(x = fc_label, y = value, fill = metric)) +
+  geom_col(position = "dodge", width = 0.65, alpha = 0.85) +
+  scale_fill_manual(values = c(
+    "Avg Crash Rate per MVMT"          = COL_ORANGE,
+    "% Segments Receiving Safety Work" = COL_BLUE
+  )) +
+  labs(
+    title    = "Risk vs Investment — Hamilton County",
+    subtitle = "Collectors and local roads are the most underserved",
+    x = NULL, y = "Value", fill = NULL
+  ) +
+  theme_odot() +
+  theme(
+    legend.position = "bottom",
+    axis.text.x     = element_text(angle = 30, hjust = 1)
+  )
+
+p_bars
+
+# ── Plot C: Fatal share bar ─────────────────────────────────────────────────
+p_fatal <- ggplot(cincinnati_fc_plot,
+                  aes(x = reorder(fc_label, -pct_of_fatals),
+                      y = pct_of_fatals,
+                      fill = bar_color)) +
+  geom_col(width = 0.65, alpha = 0.85) +
+  geom_text(aes(label = paste0(pct_of_fatals, "%")),
+            vjust = -0.5, size = 5.5, color = "#e6edf3") +
+  scale_fill_identity() +
+  scale_y_continuous(limits = c(0, 40),
+                     labels = scales::percent_format(scale = 1)) +
+  labs(
+    title    = "Hamilton County Fatalities by Road Class",
+    subtitle = "% of all Hamilton County traffic fatalities 2020–2024",
+    x        = NULL,
+    y        = "% of Local Fatalities"
+  ) +
+  theme_odot()
+
+p_fatal
+
+# ── Combined panel ────────────────────────────────────────────────────────────
+library(patchwork)
+
+cincinnati_panel <- (p_bubble | p_fatal) / p_bars +
+  plot_annotation(
+    title    = "Cincinnati (Hamilton County) — Safety Investment Analysis",
+    subtitle = "4,585 road segments | 249 total fatalities 2020–2024",
+    caption  = "Source: ODOT Crash Data 2020–2024 · Road Inventory",
+    theme    = theme(
+      plot.background = element_rect(fill = "#0d1117", color = NA),
+      plot.title      = element_text(color = "#e6edf3", size = 16, face = "bold"),
+      plot.subtitle   = element_text(color = "#8b949e", size = 11),
+      plot.caption    = element_text(color = "#8b949e", size = 9)
+    )
+  )
+
+cincinnati_panel
+```
+
+```{r}
+#####################
+### Testing DID
+#####################
+
+# Test parallel trends using pre-period years only
+# We need yearly crash rates for 2020 and 2021 (both "before" years)
+
+parallel_trends_test <- segment_year_data %>%
+  filter(CRASH_YR %in% c(2020, 2021)) %>%
+  group_by(treated_safety, CRASH_YR) %>%
+  summarise(
+    avg_crash_rate = mean(crash_rate_MVMT, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(parallel_trends_test)
+
+# Visualize
+ggplot(parallel_trends_test,
+       aes(x = CRASH_YR, y = avg_crash_rate,
+           color = treated_safety, group = treated_safety)) +
+  geom_line(linewidth = 1.3) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("FALSE" = COL_MUTED, "TRUE" = COL_BLUE),
+                     labels = c("FALSE" = "Control", "TRUE" = "Treated")) +
+  scale_x_continuous(breaks = c(2020, 2021)) +
+  labs(
+    title    = "Parallel Trends Test: Pre-Treatment Period",
+    subtitle = "Lines should be parallel for DiD assumption to hold",
+    x        = "Year",
+    y        = "Avg Crash Rate per MVMT",
+    color    = NULL
+  ) +
+  theme_odot()
+
+
+
+
+# Check how many segments appear in both before and after
+period_counts <- segment_year_data %>%
+  group_by(ROADWAY_INVENTORY_ID) %>%
+  summarise(
+    has_before = any(period == "before"),
+    has_after  = any(period == "after"),
+    .groups = "drop"
+  )
+
+table(period_counts$has_before, period_counts$has_after,
+      dnn = c("Has Before", "Has After"))
+
+
+# Compare raw vs log-transformed crash rates
+segment_year_data %>%
+  filter(crash_rate_MVMT > 0, crash_rate_MVMT < 500) %>%
+  mutate(log_rate = log(crash_rate_MVMT)) %>%
+  pivot_longer(cols = c(crash_rate_MVMT, log_rate),
+               names_to = "metric", values_to = "value") %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 80, fill = COL_BLUE, alpha = 0.7) +
+  facet_wrap(~metric, scales = "free") +
+  labs(
+    title    = "Crash Rate Distribution: Raw vs Log Transformed",
+    subtitle = "Log transformation may better satisfy model assumptions",
+    x = NULL, y = "Count"
+  ) +
+  theme_odot()
+
+# If log looks more normal, rerun DiD with log outcome
+balanced_segments <- balanced_segments %>%
+  mutate(log_crash_rate = log(crash_rate_MVMT + 0.01))
+
+did_model_log <- felm(
+  log_crash_rate ~ treated_safety * I(period == "after") |
+    ROADWAY_INVENTORY_ID + CRASH_YR |
+    0 |
+    ROADWAY_INVENTORY_ID,
+  data = balanced_segments %>% filter(is.finite(log_crash_rate))
+)
+
+summary(did_model_log)
+
+
+
+
+### RESULTS
+
+## Parralell Line test shows no extreme converging or diverging trend so that fine
+
+## 
+```
+
+```{r}
+############################################
+### ODOT Safety Investment Analysis
+### Progress Report Visualizations
+### Xavier University Senior Capstone 2026
+############################################
+
+library(tidyverse)
+library(ggplot2)
+library(patchwork)  # install.packages("patchwork") if needed
+
+# ── Shared theme ──────────────────────────────────────────────────────────────
+
+
+theme_odot <- function() {
+  theme_minimal(base_size = 12) +
+    theme(
+      plot.background    = element_rect(fill = "#0d1117", color = NA),
+      panel.background   = element_rect(fill = "#161b22", color = NA),
+      panel.grid.major   = element_line(color = "#30363d", linewidth = 0.4),
+      panel.grid.minor   = element_blank(),
+      panel.border       = element_rect(color = "#30363d", fill = NA),
+      text               = element_text(color = "#e6edf3"),
+      axis.text          = element_text(color = "#8b949e", size = 10),
+      axis.title         = element_text(color = "#e6edf3", size = 11),
+      plot.title         = element_text(color = "#e6edf3", size = 14,
+                                        face = "bold",
+                                        margin = ggplot2::margin(b = 4)),
+      plot.subtitle      = element_text(color = "#8b949e", size = 10,
+                                        margin = ggplot2::margin(b = 16)),
+      plot.caption       = element_text(color = "#8b949e", size = 9,
+                                        margin = ggplot2::margin(t = 12)),
+      legend.background  = element_rect(fill = "#161b22", color = NA),
+      legend.text        = element_text(color = "#8b949e", size = 10),
+      legend.title       = element_text(color = "#e6edf3", size = 10),
+      strip.text         = element_text(color = "#e6edf3", size = 10),
+      plot.margin        = ggplot2::margin(16, 16, 16, 16)
+    )
+}
+
+# Color palette
+COL_ORANGE  <- "#f0883e"
+COL_BLUE    <- "#58a6ff"
+COL_GREEN   <- "#3fb950"
+COL_RED     <- "#f85149"
+COL_YELLOW  <- "#d29922"
+COL_MUTED   <- "#8b949e"
+COL_SURFACE <- "#161b22"
+
+
+############################################
+### FIGURE 1: Difference-in-Differences
+### Before vs After — Matched Control
+############################################
+
+did_plot_data <- data.frame(
+  period  = factor(c("Before", "After", "Before", "After"),
+                   levels = c("Before", "After")),
+  group   = c("Control (Matched ADT)",  "Control (Matched ADT)",
+              "Treated (Safety-Funded)", "Treated (Safety-Funded)"),
+  rate    = c(10.6, 10.3, 7.65, 7.42)
+)
+
+fig1 <- ggplot(did_plot_data,
+               aes(x = period, y = rate, color = group, group = group)) +
+  geom_line(linewidth = 1.4) +
+  geom_point(size = 4) +
+  geom_label(aes(label = round(rate, 2)),
+             nudge_x = 0.07, show.legend = FALSE,
+             fill = "#161b22", size = 5.5,
+             linewidth = 0)  + # <-- replaces label.size = 0
+  scale_color_manual(values = c("Control (Matched ADT)"   = COL_MUTED,
+                                "Treated (Safety-Funded)" = COL_BLUE)) +
+  labs(
+    title    = "Difference-in-Differences: Safety Project Impact",
+    subtitle = "Segments matched on ADT volume | DiD effect = +0.07 (p = 0.908, not significant)",
+    x        = NULL,
+    y        = "Average Crash Rate (per MVMT)",
+    color    = NULL,
+    caption  = "Source: ODOT Crash Data 2020–2024"
+  ) +
+  theme_odot() +
+  theme(legend.position = "bottom")
+
+fig1
+
+
+############################################
+### FIGURE 2: DiD Effect by Project Type
+############################################
+
+category_data <- data.frame(
+  category   = c("Intersection Imp. (Safety)",
+                 "Pedestrian Facilities",
+                 "Roadway Minor Rehab",
+                 "Roadside/Median Imp.",
+                 "Pavement Treatments (Safety)",
+                 "Traffic Control (Safety)"),
+  did_effect = c(-6.54, 0.14, 0.34, 1.15, 1.65, 2.49),
+  n_segments = c(697, 277, 1266, 664, 263, 2739)
+)
+
+fig2 <- ggplot(category_data,
+               aes(x = reorder(category, -did_effect),
+                   y = did_effect,
+                   fill = did_effect < 0)) +
+  geom_col(width = 0.65) +
+  geom_hline(yintercept = 0, linetype = "dashed",
+             color = COL_MUTED, linewidth = 0.7) +
+  geom_text(aes(label = round(did_effect, 2),
+                hjust = ifelse(did_effect < 0, 1.3, -0.3)),
+            color = "#e6edf3", size = 5.5) +
+  coord_flip() +
+  scale_fill_manual(values = c("TRUE" = COL_GREEN, "FALSE" = COL_RED),
+                    labels = c("TRUE" = "Crash reduction",
+                               "FALSE" = "Crash increase")) +
+  labs(
+    title    = "Which Safety Projects Actually Reduce Crashes?",
+    subtitle = "DiD effect vs matched control segments | Negative = crash reduction",
+    x        = NULL,
+    y        = "DiD Effect (crashes per MVMT vs control)",
+    fill     = NULL,
+    caption  = "Only categories with 200+ treated segments shown"
+  ) +
+  theme_odot() +
+  theme(legend.position = "bottom")
+
+fig2
+
+
+############################################
+### FIGURE 3: Event Study — All Projects
+############################################
+
+event_data <- data.frame(
+  event_time     = -2:2,
+  avg_crash_rate = c(8.10, 7.64, 6.74, 6.80, 7.42),
+  se             = c(0.755, 0.689, 0.428, 0.409, 0.532)
+)
+
+fig3 <- ggplot(event_data, aes(x = event_time, y = avg_crash_rate)) +
+  geom_ribbon(aes(ymin = avg_crash_rate - 1.96 * se,
+                  ymax = avg_crash_rate + 1.96 * se),
+              fill = COL_BLUE, alpha = 0.15) +
+  geom_line(linewidth = 1.3, color = COL_BLUE) +
+  geom_point(size = 4, color = COL_BLUE) +
+  geom_vline(xintercept = 0, linetype = "dashed",
+             color = COL_RED, linewidth = 0.8) +
+  annotate("text", x = 0.15, y = 8.3,
+           label = "Construction\nComplete",
+           color = COL_RED, hjust = 0, size = 5.5) +
+  scale_x_continuous(breaks = -2:2) +
+  labs(
+    title    = "Event Study: Crash Rates Around Safety Project Completion",
+    subtitle = "Treated segments only | t=0 is completion year | 95% CI shown",
+    x        = "Years Relative to Project Completion",
+    y        = "Average Crash Rate (per MVMT)",
+    caption  = "n = 2,046–2,662 segments per time point"
+  ) +
+  theme_odot()
+
+fig3
+
+
+############################################
+### FIGURE 4: 2021 Cohort — Lag Test
+############################################
+
+cohort_data <- data.frame(
+  event_time     = -1:3,
+  avg_crash_rate = c(6.5, 6.9, 7.2, 8.3, 9.0)
+)
+
+fig4 <- ggplot(cohort_data, aes(x = event_time, y = avg_crash_rate)) +
+  geom_area(fill = COL_RED, alpha = 0.1) +
+  geom_line(linewidth = 1.3, color = COL_RED) +
+  geom_point(size = 4, color = COL_RED) +
+  geom_vline(xintercept = 0, linetype = "dashed",
+             color = COL_MUTED, linewidth = 0.8) +
+  annotate("text", x = 0.15, y = 9.2,
+           label = "Construction\nComplete",
+           color = COL_MUTED, hjust = 0, size = 5.5) +
+  scale_x_continuous(breaks = -1:3) +
+  labs(
+    title    = "2021 Cohort: No Lag Effect Found",
+    subtitle = "Crash rates increase steadily post-completion — no delayed safety benefit",
+    x        = "Years Relative to 2021 Project Completion",
+    y        = "Average Crash Rate (per MVMT)",
+    caption  = "Only segments completing construction in 2021 | Extended to t=+3"
+  ) +
+  theme_odot()
+
+fig4
+
+
+############################################
+### FIGURE 5: Fatalities by Functional Class
+############################################
+
+fc_data <- data.frame(
+  fc_label      = factor(c("1-Interstate","2-Freeway","3-Major Art.",
+                           "4-Minor Art.","5-Collector","6-Minor Coll.","7-Local"),
+                         levels = c("1-Interstate","2-Freeway","3-Major Art.",
+                                    "4-Minor Art.","5-Collector",
+                                    "6-Minor Coll.","7-Local")),
+  pct_fatals    = c(8.1, 2.3, 19.3, 24.0, 28.5, 4.9, 12.8),
+  crash_rate    = c(11.3, 8.0, 23.7, 25.6, 25.0, 22.6, 36.5),
+  fatal_rate    = c(0.47, 0.48, 0.40, 0.43, 0.58, 0.82, 0.58),
+  pct_treated   = c(9.8, 12.0, 14.6, 6.1, 3.6, 4.0, 1.2),
+  avg_adt       = c(29301, 14841, 13202, 8359, 3722, 1111, 1034)
+)
+
+# Highlight FC 4+5 as the key finding
+fc_data <- fc_data %>%
+  mutate(
+    highlight = fc_label %in% c("4-Minor Art.", "5-Collector"),
+    bar_color = case_when(
+      fc_label %in% c("1-Interstate", "2-Freeway") ~ COL_BLUE,
+      fc_label %in% c("4-Minor Art.", "5-Collector") ~ COL_RED,
+      fc_label == "7-Local" ~ COL_ORANGE,
+      TRUE ~ COL_YELLOW
+    )
+  )
+
+fig5 <- ggplot(fc_data, aes(x = fc_label)) +
+  geom_col(aes(y = pct_fatals, fill = bar_color),
+           width = 0.6, alpha = 0.85) +
+  geom_line(aes(y = crash_rate, group = 1),
+            color = "white", linewidth = 1.2) +
+  geom_point(aes(y = crash_rate),
+             color = "white", size = 5.5) +
+  scale_fill_identity() +
+  scale_y_continuous(
+    name     = "% of All Fatalities (bars)",
+    sec.axis = sec_axis(~., name = "Avg Crash Rate per MVMT (line)")
+  ) +
+  annotate("rect", xmin = 3.55, xmax = 5.45,
+           ymin = -1, ymax = 31,
+           fill = COL_RED, alpha = 0.06) +
+  annotate("text", x = 4.5, y = 33,
+           label = "52.5% of all\nfatalities",
+           color = COL_RED, size = 5.5, fontface = "bold") +
+  labs(
+    title    = "Where Is the Harm? Fatalities & Crash Rates by Road Class",
+    subtitle = "FC 4 + FC 5 roads account for more than half of all Ohio traffic fatalities",
+    x        = NULL,
+    caption  = "Source: ODOT Crash Data 2020–2024 · 4,466 total fatalities"
+  ) +
+  theme_odot() +
+  theme(axis.title.y.right = element_text(color = "white"))
+
+fig5
+
+
+#Minor Arterial roads are a bridge between high-speed highways and local 
+#neighborhood streets. They are designed to carry moderate-length trips through 
+#a region at slower speeds
+
+#Collector roads are low-to-moderate capacity roads that "collect" traffic from 
+#local residential streets and funnel it onto major arterials or highways. 
+
+############################################
+### FIGURE 6: The Investment Gap
+### % Treated vs Crash Rate (bubble = fatality share)
+############################################
+
+fig6 <- ggplot(fc_data,
+               aes(x = pct_treated, y = crash_rate,
+                   size = pct_fatals, fill = bar_color)) +
+  geom_point(shape = 21, alpha = 0.8, color = "#0d1117", stroke = 1.5) +
+  geom_text(aes(label = fc_label),
+            vjust = -1.4, size = 5.5, color = "#e6edf3") +
+  # Danger zone annotation
+  annotate("rect", xmin = -0.5, xmax = 5,
+           ymin = 28, ymax = 40,
+           fill = COL_RED, alpha = 0.05,
+           linetype = "dashed", color = COL_RED, linewidth = 0.5) +
+  annotate("text", x = 2.5, y = 39,
+           label = "High risk, low investment",
+           color = COL_RED, size = 3, fontface = "italic") +
+  scale_fill_identity() +
+  scale_size_continuous(range = c(4, 18), name = "% of All Fatalities") +
+  scale_x_continuous(limits = c(-0.5, 17),
+                     labels = scales::percent_format(scale = 1)) +
+  labs(
+    title    = "The Investment Gap: Where Safety Funding Goes vs Where It's Needed",
+    subtitle = "Bubble size = share of all fatalities | Local roads sit in the danger zone",
+    x        = "% of Segments Receiving Safety Investment",
+    y        = "Average Crash Rate (per MVMT)",
+    caption  = "Ideal: high investment AND low crash rate (upper left = over-invested, lower right = under-invested)"
+  ) +
+  theme_odot() +
+  theme(legend.position = "right")
+
+fig6
+
+
+############################################
+### FIGURE 7: Investment Gap Bar Chart
+### Side-by-side: % treated vs crash rate
+############################################
+
+gap_long <- fc_data %>%
+  select(fc_label, pct_treated, crash_rate) %>%
+  pivot_longer(cols = c(pct_treated, crash_rate),
+               names_to = "metric", values_to = "value") %>%
+  mutate(
+    metric = case_when(
+      metric == "pct_treated" ~ "% Segments Receiving Safety Work",
+      metric == "crash_rate"  ~ "Avg Crash Rate per MVMT"
+    )
+  )
+
+fig7 <- ggplot(gap_long,
+               aes(x = fc_label, y = value,
+                   fill = metric)) +
+  geom_col(position = "dodge", width = 0.65, alpha = 0.85) +
+  scale_fill_manual(values = c(
+    "% Segments Receiving Safety Work" = COL_BLUE,
+    "Avg Crash Rate per MVMT"          = COL_ORANGE
+  )) +
+  labs(
+    title    = "Safety Investment Rate vs Road Risk by Functional Class",
+    subtitle = "Investment (blue) vs crash rate (orange) — gap is largest for local roads",
+    x        = NULL,
+    y        = "Value",
+    fill     = NULL,
+    caption  = "Local roads (FC 7): 1.2% investment rate despite highest crash rate (36.5/MVMT)"
+  ) +
+  theme_odot() +
+  theme(
+    legend.position  = "bottom",
+    axis.text.x      = element_text(angle = 30, hjust = 1)
+  )
+
+fig7
+
+
+############################################
+### FIGURE 8: High Risk Road Profile
+### Improved vs Worsened segments
+############################################
+
+profile_data <- data.frame(
+  group    = c("Improved", "Worsened"),
+  avg_adt  = c(11666, 11086),
+  avg_pcr  = c(81.6, 82.1),
+  avg_spd  = c(40.6, 41.6),
+  baseline = c(39.1, 31.4),
+  n        = c(15667, 23473)
+)
+
+profile_long <- profile_data %>%
+  select(group, avg_adt, avg_pcr, avg_spd, baseline) %>%
+  pivot_longer(-group, names_to = "metric", values_to = "value") %>%
+  mutate(metric = case_when(
+    metric == "avg_adt"  ~ "Avg ADT (Traffic Volume)",
+    metric == "avg_pcr"  ~ "Avg PCR (Pavement Score)",
+    metric == "avg_spd"  ~ "Avg Speed Limit (mph)",
+    metric == "baseline" ~ "Baseline Crash Rate (per MVMT)"
+  ))
+
+fig8 <- ggplot(profile_long,
+               aes(x = group, y = value, fill = group)) +
+  geom_col(width = 0.55, alpha = 0.85) +
+  facet_wrap(~metric, scales = "free_y", nrow = 1) +
+  scale_fill_manual(values = c("Improved" = COL_BLUE,
+                               "Worsened" = COL_RED)) +
+  labs(
+    title    = "Road Characteristics: Improved vs Worsened Segments",
+    subtitle = "Baseline crash rate is the key differentiator — all other characteristics nearly identical",
+    x        = NULL,
+    y        = NULL,
+    fill     = NULL,
+    caption  = "Improved n=15,667 | Worsened n=23,473 | Improvement defined as crash rate decline before→after"
+  ) +
+  theme_odot() +
+  theme(
+    legend.position = "none",
+    strip.text      = element_text(size = 9, color = "#8b949e")
+  )
+
+fig8
+```
+
+```{r}
+############################################
+### Case Study: Find Candidate Projects
+############################################
+
+case_study_candidates <- analysis_df %>%
+  st_drop_geometry() %>%
+  inner_join(
+    projects_safety %>%
+      select(NLF_ID, CTL_BEGIN, CTL_END, completion_year,
+             PRIMARY_WORK_CATEGORY, EST_TOTAL_CONSTR_COST,
+             COUNTY_NME, DISTRICT_NBR, PROJECT_NME,
+             END_CONSTR_MILESTONE_DT),
+    by = "NLF_ID",
+    relationship = "many-to-many"
+  ) %>%
+  filter(
+    CTL_BEGIN_NBR <= CTL_END.y,  # project end >= segment start
+    CTL_END_NBR >= CTL_BEGIN.y   # project start <= segment end
+  ) %>%
+  filter(
+    PRIMARY_WORK_CATEGORY %in% c(
+      "Intersection Improvement (Safety)",
+      "Traffic Control (Safety)",
+      "Roadway Minor Rehab"
+    )
+  ) %>%
+  left_join(
+    segment_year_data %>%
+      group_by(ROADWAY_INVENTORY_ID) %>%
+      summarise(
+        before_rate = mean(crash_rate_MVMT[period == "before"], na.rm = TRUE),
+        after_rate  = mean(crash_rate_MVMT[period == "after"],  na.rm = TRUE),
+        change      = after_rate - before_rate,
+        .groups     = "drop"
+      ),
+    by = "ROADWAY_INVENTORY_ID"
+  ) %>%
+  filter(!is.na(change)) %>%
+  select(ROADWAY_INVENTORY_ID, NLF_ID, PROJECT_NME, COUNTY_NME,
+         COUNTY_CD.x, PRIMARY_WORK_CATEGORY, completion_year,
+         EST_TOTAL_CONSTR_COST, FUNCTION_CLASS_CD, ADT_TOTAL_NBR,
+         SPEED_LIMIT_NBR, before_rate, after_rate, change)
+
+# Check Hamilton County availability
+case_study_candidates %>%
+  filter(COUNTY_CD.x == "HAM") %>%
+  count(PRIMARY_WORK_CATEGORY, sort = TRUE) %>%
+  as.data.frame()
+```
+
+```{r}
+# Best intersection improvement — biggest crash reduction
+best_intersection <- case_study_candidates %>%
+  filter(COUNTY_CD.x == "HAM",
+         PRIMARY_WORK_CATEGORY == "Intersection Improvement (Safety)") %>%
+  slice_min(change, n = 3) %>%
+  select(ROADWAY_INVENTORY_ID, PROJECT_NME, COUNTY_NME,
+         completion_year, before_rate, after_rate, change,
+         EST_TOTAL_CONSTR_COST, FUNCTION_CLASS_CD, ADT_TOTAL_NBR)
+
+# Best traffic control — biggest crash increase (most interesting negative case)
+best_traffic <- case_study_candidates %>%
+  filter(COUNTY_CD.x == "HAM",
+         PRIMARY_WORK_CATEGORY == "Traffic Control (Safety)") %>%
+  slice_max(change, n = 3) %>%
+  select(ROADWAY_INVENTORY_ID, PROJECT_NME, COUNTY_NME,
+         completion_year, before_rate, after_rate, change,
+         EST_TOTAL_CONSTR_COST, FUNCTION_CLASS_CD, ADT_TOTAL_NBR)
+
+# Best rehab — closest to zero change (true null result)
+best_rehab <- case_study_candidates %>%
+  filter(COUNTY_CD.x == "HAM",
+         PRIMARY_WORK_CATEGORY == "Roadway Minor Rehab") %>%
+  mutate(abs_change = abs(change)) %>%
+  slice_min(abs_change, n = 3) %>%
+  select(ROADWAY_INVENTORY_ID, PROJECT_NME, COUNTY_NME,
+         completion_year, before_rate, after_rate, change,
+         EST_TOTAL_CONSTR_COST, FUNCTION_CLASS_CD, ADT_TOTAL_NBR)
+
+cat("=== INTERSECTION IMPROVEMENT CANDIDATES ===\n")
+as.data.frame(best_intersection)
+
+cat("\n=== TRAFFIC CONTROL CANDIDATES ===\n")
+as.data.frame(best_traffic)
+
+cat("\n=== ROADWAY REHAB CANDIDATES ===\n")
+as.data.frame(best_rehab)
+```
+
+```{r}
+############################################
+### Case Study Profiles
+############################################
+
+# Define our three chosen segments
+case_ids <- c(
+  "2024_000000000018030",  # Intersection - Plainfield Roundabouts
+  "2024_000000000271525",  # Traffic Control - Eastern Corridor
+  "2024_000000000270710"   # Rehab - SR 32/SR 125
+)
+
+case_labels <- c(
+  "2024_000000000018030" = "Plainfield Rd Roundabouts\n(Intersection Improvement)",
+  "2024_000000000271525" = "Eastern Corridor VAR TSG\n(Traffic Control)",
+  "2024_000000000270710" = "SR 32/SR 125\n(Roadway Minor Rehab)"
+)
+
+case_colors <- c(
+  "2024_000000000018030" = COL_GREEN,
+  "2024_000000000271525" = COL_RED,
+  "2024_000000000270710" = COL_MUTED
+)
+
+# Pull yearly crash rates for each case study segment
+case_yearly <- segment_year_data %>%
+  filter(ROADWAY_INVENTORY_ID %in% case_ids) %>%
+  left_join(
+    case_study_candidates %>%
+      filter(ROADWAY_INVENTORY_ID %in% case_ids) %>%
+      distinct(ROADWAY_INVENTORY_ID, completion_year, PROJECT_NME,
+               PRIMARY_WORK_CATEGORY, EST_TOTAL_CONSTR_COST,
+               before_rate, after_rate, change),
+    by = "ROADWAY_INVENTORY_ID"
+  ) %>%
+  mutate(
+    label     = case_labels[ROADWAY_INVENTORY_ID],
+    seg_color = case_colors[ROADWAY_INVENTORY_ID]
+  )
+
+
+case_yearly <- case_yearly %>%
+  left_join(
+    analysis_df %>%
+      st_drop_geometry() %>%
+      select(ROADWAY_INVENTORY_ID, FUNCTION_CLASS_CD) %>%
+      rename(FC = FUNCTION_CLASS_CD),
+    by = "ROADWAY_INVENTORY_ID"
+  ) %>%
+  mutate(FUNCTION_CLASS_CD = FC) %>%
+  select(-FC)
+
+# Check we have data
+case_yearly %>%
+  group_by(ROADWAY_INVENTORY_ID, label) %>%
+  summarise(
+    years     = paste(sort(unique(CRASH_YR)), collapse = ", "),
+    min_rate  = round(min(crash_rate_MVMT, na.rm = TRUE), 2),
+    max_rate  = round(max(crash_rate_MVMT, na.rm = TRUE), 2),
+    .groups   = "drop"
+  ) %>%
+  as.data.frame()
+```
+
+```{r}
+############################################
+### Case Study Visualizations
+############################################
+
+# ── Individual yearly trend plots ─────────────────────────────────────────────
+
+plot_case_study <- function(seg_id) {
+  
+  seg_data <- case_yearly %>%
+    filter(ROADWAY_INVENTORY_ID == seg_id)
+  
+  comp_year  <- unique(seg_data$completion_year)
+  proj_name  <- unique(seg_data$PROJECT_NME)
+  work_cat   <- unique(seg_data$PRIMARY_WORK_CATEGORY)
+  cost       <- scales::dollar(unique(seg_data$EST_TOTAL_CONSTR_COST))
+  before     <- round(unique(seg_data$before_rate), 1)
+  after      <- round(unique(seg_data$after_rate), 1)
+  chg        <- round(unique(seg_data$change), 1)
+  seg_color  <- unique(seg_data$seg_color)
+  
+  chg_label  <- ifelse(chg < 0,
+                       paste0("▼ ", abs(chg), " per MVMT"),
+                       paste0("▲ ", abs(chg), " per MVMT"))
+  chg_color  <- ifelse(chg < 0, COL_GREEN, COL_RED)
+  
+  ggplot(seg_data, aes(x = CRASH_YR, y = crash_rate_MVMT)) +
+    geom_area(fill = seg_color, alpha = 0.1) +
+    geom_line(color = seg_color, linewidth = 1.3) +
+    geom_point(color = seg_color, size = 4) +
+    geom_vline(xintercept = comp_year, linetype = "dashed",
+               color = COL_ORANGE, linewidth = 0.8) +
+    annotate("text", x = comp_year + 0.08,
+             y = max(seg_data$crash_rate_MVMT, na.rm = TRUE) * 0.95,
+             label = paste0("Completed\n", comp_year),
+             color = COL_ORANGE, hjust = 0, size = 5.5) +
+    annotate("label",
+             x = mean(range(seg_data$CRASH_YR)),
+             y = max(seg_data$crash_rate_MVMT, na.rm = TRUE) * 0.5,
+             label = paste0("Before: ", before,
+                            "\nAfter:  ", after,
+                            "\nChange: ", chg_label),
+             fill = "#1c2128", color = chg_color,
+             size = 5.5, label.size = 0.5,
+             label.padding = unit(0.4, "lines")) +
+    scale_x_continuous(breaks = unique(seg_data$CRASH_YR)) +
+    labs(
+      title    = proj_name,
+      subtitle = paste0(work_cat, " | Cost: ", cost),
+      x        = "Year",
+      y        = "Crash Rate (per MVMT)",
+      caption  = paste0("Segment ID: ", seg_id,
+                        " | FC: ", unique(seg_data$FUNCTION_CLASS_CD),
+                        " | ADT: ", 
+                        scales::comma(unique(seg_data$ADT_TOTAL_NBR)))
+    ) +
+    theme_odot()
+}
+
+# Generate all three plots
+p_intersection <- plot_case_study("2024_000000000018030")
+p_traffic      <- plot_case_study("2024_000000000271525")
+p_rehab        <- plot_case_study("2024_000000000270710")
+
+p_intersection
+p_traffic
+p_rehab
+
+# ── Summary comparison panel ──────────────────────────────────────────────────
+
+summary_data <- case_study_candidates %>%
+  filter(ROADWAY_INVENTORY_ID %in% case_ids) %>%
+  distinct(ROADWAY_INVENTORY_ID, .keep_all = TRUE) %>%
+  mutate(
+    label     = case_labels[ROADWAY_INVENTORY_ID],
+    seg_color = case_colors[ROADWAY_INVENTORY_ID],
+    outcome   = case_when(
+      change < 0 ~ "Improved",
+      change > 0 ~ "Worsened",
+      TRUE       ~ "No Change"
+    )
+  ) %>%
+  pivot_longer(cols = c(before_rate, after_rate),
+               names_to = "period", values_to = "rate") %>%
+  mutate(period = factor(ifelse(period == "before_rate", 
+                                "Before", "After"),
+                         levels = c("Before", "After")))
+
+p_summary <- ggplot(summary_data,
+                    aes(x = period, y = rate,
+                        color = ROADWAY_INVENTORY_ID,
+                        group = ROADWAY_INVENTORY_ID)) +
+  geom_line(linewidth = 1.4) +
+  geom_point(size = 4) +
+  geom_label(aes(label = round(rate, 1)),
+             nudge_x = 0.08, show.legend = FALSE,
+             fill = "#161b22", size = 5.5, linewidth = 0) +
+  scale_color_manual(values = case_colors,
+                     labels = c(
+                       "2024_000000000018030" = "Plainfield Roundabouts",
+                       "2024_000000000271525" = "Eastern Corridor Traffic Control",
+                       "2024_000000000270710" = "SR 32/SR 125 Rehab"
+                     )) +
+  labs(
+    title    = "Case Study Comparison: Three Hamilton County Projects",
+    subtitle = "Before vs after crash rates | Each line is one project",
+    x        = NULL,
+    y        = "Avg Crash Rate (per MVMT)",
+    color    = NULL,
+    caption  = "Hamilton County, Ohio | Safety-funded projects completing 2021–2023"
+  ) +
+  theme_odot() +
+  theme(legend.position = "bottom")
+
+p_summary
+
+# ── Combined panel ─────────────────────────────────────────────────────────────
+case_study_panel <- (p_intersection | p_traffic | p_rehab) / p_summary +
+  plot_annotation(
+    title    = "Hamilton County Case Studies: What Do Safety Projects Actually Do?",
+    subtitle = "Three projects — three different outcomes",
+    caption  = "Source: ODOT Construction Projects & Crash Data 2020–2024",
+    theme    = theme(
+      plot.background = element_rect(fill = "#0d1117", color = NA),
+      plot.title      = element_text(color = "#e6edf3", size = 16,
+                                     face = "bold"),
+      plot.subtitle   = element_text(color = "#8b949e", size = 11),
+      plot.caption    = element_text(color = "#8b949e", size = 9)
+    )
+  )
+
+case_study_panel
+
+#ggsave("hamilton_case_studies.png", case_study_panel,
+ #      width = 16, height = 10, dpi = 150, bg = "#0d1117")
+
+
+# Build from scratch using ALL project types
+hamilton_all_types <- analysis_df %>%
+  st_drop_geometry() %>%
+  filter(COUNTY_CD.x == "HAM") %>%
+  inner_join(
+    projects_safety %>%
+      select(NLF_ID, CTL_BEGIN, CTL_END, completion_year,
+             PRIMARY_WORK_CATEGORY, EST_TOTAL_CONSTR_COST),
+    by = "NLF_ID",
+    relationship = "many-to-many"
+  ) %>%
+  filter(
+    CTL_BEGIN_NBR <= CTL_END.y,
+    CTL_END_NBR   >= CTL_BEGIN.y
+  ) %>%
+  distinct(ROADWAY_INVENTORY_ID, PRIMARY_WORK_CATEGORY, 
+           completion_year, .keep_all = TRUE)
+
+# Check all categories present
+cat("Categories found:", n_distinct(hamilton_all_types$PRIMARY_WORK_CATEGORY), "\n")
+
+# Join yearly data and summarise
+segment_year_data %>%
+  filter(ROADWAY_INVENTORY_ID %in% 
+           hamilton_all_types$ROADWAY_INVENTORY_ID) %>%
+  left_join(
+    hamilton_all_types %>%
+      select(ROADWAY_INVENTORY_ID, PRIMARY_WORK_CATEGORY),
+    by = "ROADWAY_INVENTORY_ID"
+  ) %>%
+  group_by(PRIMARY_WORK_CATEGORY) %>%
+  summarise(
+    n_segments = n_distinct(ROADWAY_INVENTORY_ID),
+    avg_before = round(mean(crash_rate_MVMT[period == "before"], 
+                            na.rm = TRUE), 2),
+    avg_after  = round(mean(crash_rate_MVMT[period == "after"],  
+                            na.rm = TRUE), 2),
+    .groups    = "drop"
+  ) %>%
+  mutate(
+    change    = round(avg_after - avg_before, 3),
+    direction = case_when(
+      change < -0.5 ~ "Improved",
+      change >  0.5 ~ "Worsened",
+      TRUE          ~ "No Change"
+    )
+  ) %>%
+  arrange(change) %>%
+  as.data.frame()
+```
+
+```{r}
+# Cost per unit of crash reduction
+case_study_candidates %>%
+  filter(ROADWAY_INVENTORY_ID %in% case_ids) %>%
+  distinct(ROADWAY_INVENTORY_ID, .keep_all = TRUE) %>%
+  mutate(
+    # Cost per crash rate point reduced
+    cost_per_unit_reduction = EST_TOTAL_CONSTR_COST / abs(change),
+    # Annualized cost effectiveness
+    crashes_reduced_per_million = (abs(change) / 
+                                  EST_TOTAL_CONSTR_COST) * 1e6
+  ) %>%
+  select(PROJECT_NME, PRIMARY_WORK_CATEGORY,
+         EST_TOTAL_CONSTR_COST, change,
+         cost_per_unit_reduction,
+         crashes_reduced_per_million) %>%
+  as.data.frame()
+```
+
+```{r}
+# Add cost effectiveness to the summary comparison plot
+cost_data <- data.frame(
+  project = c("Plainfield\nRoundabouts",
+              "Eastern Corridor\nTraffic Control",
+              "SR 32/SR 125\nRehab"),
+  cost_millions     = c(8.863, 0.337, 1.616),
+  crashes_per_million = c(5.10, -44.34, 0.00),
+  color = c(COL_GREEN, COL_RED, COL_MUTED)
+)
+
+p_cost <- ggplot(cost_data,
+                 aes(x = reorder(project, crashes_per_million),
+                     y = crashes_per_million,
+                     fill = color)) +
+  geom_col(width = 0.55, alpha = 0.85) +
+  geom_hline(yintercept = 0, linetype = "dashed",
+             color = COL_MUTED, linewidth = 0.7) +
+  geom_text(aes(label = paste0(crashes_per_million,
+                               "\nper $1M")),
+            vjust = ifelse(cost_data$crashes_per_million >= 0,
+                          -0.3, 1.3),
+            color = "#e6edf3", size = 5.5) +
+  scale_fill_identity() +
+  coord_flip() +
+  labs(
+    title    = "Cost Effectiveness: Crashes Reduced per $1M Spent",
+    subtitle = "Hamilton County case studies | Negative = crashes increased",
+    x        = NULL,
+    y        = "Crash Rate Units Reduced per $1M",
+    caption  = "Positive = safety improvement per dollar | Negative = safety worsened per dollar"
+  ) +
+  theme_odot()
+
+p_cost
+```
+
+```{r}
+# Find more candidates excluding all projects we've already used
+used_ids <- c(
+  "2024_000000000018030",  # Plainfield Roundabouts
+  "2024_000000000271525",  # Eastern Corridor VAR TSG
+  "2024_000000000270710",  # SR 32/SR 125
+  "2024_000000000270927",  # Cincinnati PSIP Pedestrian
+  "2024_000000000119861",  # GR Type A Roadside
+  "2024_000000000120118"   # Cincinnati Friction
+)
+
+new_candidates_3 <- hamilton_all_types %>%
+  filter(!ROADWAY_INVENTORY_ID %in% used_ids) %>%
+  left_join(
+    projects_safety %>%
+      select(NLF_ID, PROJECT_NME) %>%
+      distinct(),
+    by = "NLF_ID"
+  ) %>%
+  left_join(
+    segment_year_data %>%
+      group_by(ROADWAY_INVENTORY_ID) %>%
+      summarise(
+        before_rate = mean(crash_rate_MVMT[period == "before"], na.rm = TRUE),
+        after_rate  = mean(crash_rate_MVMT[period == "after"],  na.rm = TRUE),
+        change      = after_rate - before_rate,
+        .groups     = "drop"
+      ),
+    by = "ROADWAY_INVENTORY_ID"
+  ) %>%
+  filter(!is.na(change)) %>%
+  distinct(ROADWAY_INVENTORY_ID, PRIMARY_WORK_CATEGORY, .keep_all = TRUE) %>%
+  select(ROADWAY_INVENTORY_ID, PROJECT_NME, PRIMARY_WORK_CATEGORY,
+         COUNTY_CD.x, completion_year, before_rate, after_rate,
+         change, EST_TOTAL_CONSTR_COST, FUNCTION_CLASS_CD,
+         ADT_TOTAL_NBR) %>%
+  arrange(change)
+
+as.data.frame(new_candidates_3)
+```
+
+```{r}
+
+
+```
+
+```{r}
+
+
+```
+
+```{r}
+############################################
+### All Ohio Projects — Trend Per Category
+### Centered on event time (t=0 = completion)
+############################################
+
+# Build statewide version with all categories
+ohio_all_types <- analysis_df %>%
+  st_drop_geometry() %>%
+  inner_join(
+    projects_safety %>%
+      select(NLF_ID, CTL_BEGIN, CTL_END, completion_year,
+             PRIMARY_WORK_CATEGORY, EST_TOTAL_CONSTR_COST),
+    by = "NLF_ID",
+    relationship = "many-to-many"
+  ) %>%
+  filter(
+    CTL_BEGIN_NBR <= CTL_END.y,
+    CTL_END_NBR   >= CTL_BEGIN.y,
+    !is.na(completion_year)
+  ) %>%
+  distinct(ROADWAY_INVENTORY_ID, PRIMARY_WORK_CATEGORY,
+           completion_year, .keep_all = TRUE)
+
+# Join yearly crash rates and compute event time
+ohio_yearly_full <- segment_year_data %>%
+  filter(ROADWAY_INVENTORY_ID %in%
+           ohio_all_types$ROADWAY_INVENTORY_ID) %>%
+  left_join(
+    ohio_all_types %>%
+      select(ROADWAY_INVENTORY_ID, PRIMARY_WORK_CATEGORY,
+             completion_year) %>%
+      distinct(ROADWAY_INVENTORY_ID, PRIMARY_WORK_CATEGORY,
+               completion_year),
+    by = "ROADWAY_INVENTORY_ID",
+    relationship = "many-to-many"
+  ) %>%
+  filter(
+    !is.na(PRIMARY_WORK_CATEGORY),
+    !is.na(completion_year.y)        # <-- use .y suffix
+  ) %>%
+  mutate(
+    event_time = CRASH_YR - completion_year.y
+  ) %>%
+  filter(event_time >= -2, event_time <= 2)
+
+# Check coverage
+ohio_yearly_full %>%
+  group_by(PRIMARY_WORK_CATEGORY) %>%
+  summarise(
+    n_segments  = n_distinct(ROADWAY_INVENTORY_ID),
+    years_avail = paste(sort(unique(event_time)), collapse = ", "),
+    .groups     = "drop"
+  ) %>%
+  arrange(desc(n_segments)) %>%
+  as.data.frame()
+
+
+############################################
+### Ohio Statewide Event Study — All Categories
+############################################
+
+# Summarise by category and event time
+ohio_event_summary <- ohio_yearly_full %>%
+  group_by(PRIMARY_WORK_CATEGORY, event_time) %>%
+  summarise(
+    avg_crash_rate = mean(crash_rate_MVMT, na.rm = TRUE),
+    se             = sd(crash_rate_MVMT, na.rm = TRUE) / sqrt(n()),
+    n_segments     = n_distinct(ROADWAY_INVENTORY_ID),
+    .groups        = "drop"
+  ) %>%
+  group_by(PRIMARY_WORK_CATEGORY) %>%
+  mutate(
+    did_change = mean(avg_crash_rate[event_time >= 0], na.rm = TRUE) -
+                 mean(avg_crash_rate[event_time < 0],  na.rm = TRUE),
+    direction  = case_when(
+      did_change < -0.5 ~ "Improved",
+      did_change >  0.5 ~ "Worsened",
+      TRUE              ~ "No Change"
+    )
+  ) %>%
+  ungroup()
+
+# Color by outcome
+outcome_colors <- c(
+  "Improved"  = COL_GREEN,
+  "Worsened"  = COL_RED,
+  "No Change" = COL_MUTED
+)
+
+# Build one plot per category
+ohio_plots <- lapply(
+  unique(ohio_event_summary$PRIMARY_WORK_CATEGORY),
+  function(cat) {
+    
+    cat_data   <- ohio_event_summary %>% 
+                    filter(PRIMARY_WORK_CATEGORY == cat)
+    direction  <- unique(cat_data$direction)
+    seg_color  <- outcome_colors[direction]
+    n_segs     <- max(cat_data$n_segments)
+    chg        <- round(unique(cat_data$did_change), 2)
+    chg_label  <- ifelse(chg < 0,
+                         paste0("▼ ", abs(chg), "/MVMT"),
+                         paste0("▲ ", abs(chg), "/MVMT"))
+    sparse     <- n_segs < 20
+    
+    ggplot(cat_data,
+           aes(x = event_time, y = avg_crash_rate)) +
+      geom_ribbon(aes(ymin = avg_crash_rate - 1.96 * se,
+                      ymax = avg_crash_rate + 1.96 * se),
+                  fill = seg_color, alpha = 0.15) +
+      geom_line(color = seg_color, linewidth = 1.2) +
+      geom_point(color = seg_color, size = 3) +
+      geom_vline(xintercept = 0, linetype = "dashed",
+                 color = COL_ORANGE, linewidth = 0.7) +
+      annotate("text", x = 0.1,
+               y = max(cat_data$avg_crash_rate +
+                         1.96 * cat_data$se, na.rm = TRUE) * 0.97,
+               label = "Completion",
+               color = COL_ORANGE, hjust = 0, size = 5.0) +
+      annotate("label",
+               x = -1.9,
+               y = max(cat_data$avg_crash_rate +
+                         1.96 * cat_data$se, na.rm = TRUE) * 0.6,
+               label = paste0(direction, ": ", chg_label,
+                              if (sparse) "\n⚠ Low n" else ""),
+               fill    = "#1c2128",
+               color   = seg_color,
+               size    = 2.8,
+               label.size     = 0.4,
+               label.padding  = unit(0.3, "lines"),
+               hjust   = 0) +
+      scale_x_continuous(breaks = -2:2,
+                         labels = c("-2", "-1", "0\n(Completion)",
+                                    "+1", "+2")) +
+      labs(
+        title    = cat,
+        subtitle = paste0("n = ", n_segs,
+                          " segments | Ohio Statewide | 95% CI shown"),
+        x        = "Years Relative to Project Completion",
+        y        = "Avg Crash Rate (per MVMT)"
+      ) +
+      theme_odot() +
+      theme(plot.title = element_text(size = 11))
+  }
+)
+
+for (p in ohio_plots) { print(p) }
+```
+
+```{r}
+#####################
+### updated fig 6
+#####################
+
+# Rebuild fig6 investment gap data with funding % instead of segment %
+fc_labels <- c(
+  "1" = "FC1: Interstate",
+  "2" = "FC2: Freeway",
+  "3" = "FC3: Major Arterial",
+  "4" = "FC4: Minor Arterial",
+  "5" = "FC5: Collector",
+  "6" = "FC6: Minor Collector",
+  "7" = "FC7: Local"
+)
+
+investment_gap_funding <- data.frame(
+  FUNCTION_CLASS_CD = c(1,2,3,4,5,6,7),
+  pct_funding       = c(22.0, 6.9, 39.5, 19.8, 9.8, 0.6, 1.4),
+  crash_rate        = c(11.3, 8.0, 23.7, 25.6, 25.0, 22.6, 36.5),
+  pct_fatalities    = c(8.1, 2.3, 19.3, 24.0, 28.5, 4.9, 12.8)
+) %>%
+  mutate(
+    fc_label   = fc_labels[as.character(FUNCTION_CLASS_CD)],
+    bubble_size = pct_fatalities
+  )
+
+fig6_updated <- ggplot(investment_gap_funding,
+       aes(x = pct_funding,
+           y = crash_rate,
+           size = bubble_size,
+           color = factor(FUNCTION_CLASS_CD))) +
+  geom_point(alpha = 0.85) +
+  geom_text(aes(label = fc_label),
+            vjust = -1.2, size = 4.0,
+            color = "#e6edf3", fontface = "bold") +
+  annotate("rect", xmin = 0, xmax = 12,
+           ymin = 22, ymax = 40,
+           fill = COL_RED, alpha = 0.06) +
+  annotate("text", x = 6, y = 39,
+           label = "High risk · Low funding",
+           color = COL_RED, size = 3, fontface = "italic") +
+  annotate("rect", xmin = 25, xmax = 70,
+           ymin = 0, ymax = 15,
+           fill = COL_BLUE, alpha = 0.06) +
+  annotate("text", x = 47, y = 14,
+           label = "Low risk · High funding",
+           color = COL_BLUE, size = 4, fontface = "italic") +
+  scale_size_continuous(range = c(4, 18),
+                        name = "% of Fatalities") +
+  scale_color_manual(values = c(
+    "1" = COL_BLUE, "2" = COL_BLUE,
+    "3" = COL_YELLOW, "4" = COL_ORANGE,
+    "5" = COL_RED, "6" = COL_RED,
+    "7" = COL_RED
+  ), guide = "none") +
+  labs(
+    title    = "Safety Investment Gap by Road Class",
+    subtitle = "Bubble size = share of statewide fatalities",
+    x        = "% of Total Safety Funding Received",
+    y        = "Avg Crash Rate (per MVMT)",
+    caption  = "Source: ODOT Construction Projects & Crash Data 2020–2024"
+  ) +
+  theme_odot()
+
+fig6_updated
+```
+
+```{r}
+# Convert 2022 crashes to sf and spatial join to segments
+crashes_2022_sf <- Crash2022 %>%
+  filter(!is.na(ODOT_LATITUDE_NBR), !is.na(ODOT_LONGITUDE_NBR)) %>%
+  st_as_sf(coords = c("ODOT_LONGITUDE_NBR", "ODOT_LATITUDE_NBR"),
+           crs = 4326) %>%
+  st_transform(st_crs(analysis_df))
+
+# Spatial join to nearest segment
+crashes_2022_joined <- crashes_2022_sf %>%
+  mutate(
+    ROADWAY_INVENTORY_ID = analysis_df$ROADWAY_INVENTORY_ID[
+      st_nearest_feature(., analysis_df)
+    ]
+  ) %>%
+  st_drop_geometry()
+
+# Aggregate to segment level
+crashes_2022_summary <- crashes_2022_joined %>%
+  group_by(ROADWAY_INVENTORY_ID) %>%
+  summarise(
+    yearly_crashes = n(),
+    yearly_fatal   = sum(CRASH_SEVERITY_CD == 1, na.rm = TRUE),
+    yearly_injury  = sum(CRASH_SEVERITY_CD %in% c(2,3), na.rm = TRUE),
+    CRASH_YR       = 2022,
+    .groups        = "drop"
+  ) %>%
+  left_join(
+    analysis_df %>%
+      st_drop_geometry() %>%
+      select(ROADWAY_INVENTORY_ID, SEGMENT_LENGTH_NBR, ADT_TOTAL_NBR),
+    by = "ROADWAY_INVENTORY_ID"
+  ) %>%
+  mutate(
+    MVMT           = ADT_TOTAL_NBR * SEGMENT_LENGTH_NBR * 365 / 1e6,
+    crash_rate_MVMT = ifelse(MVMT > 0, yearly_crashes / MVMT, NA),
+    period         = "transition",
+    treated_safety = ROADWAY_INVENTORY_ID %in% 
+                       treated_safety_ids$ROADWAY_INVENTORY_ID,
+    completion_year = NA_real_,
+    event_time     = NA_real_
+  )
+
+cat("2022 segments processed:", nrow(crashes_2022_summary), "\n")
+cat("2022 treated segments:", 
+    sum(crashes_2022_summary$treated_safety), "\n")
+
+# Add 2022 to segment_year_data
+crashes_2022_summary <- crashes_2022_summary %>%
+  mutate(
+    treated        = ROADWAY_INVENTORY_ID %in% 
+                       analysis_df$ROADWAY_INVENTORY_ID,
+    treated_safety = ROADWAY_INVENTORY_ID %in%
+                       treated_safety_ids$ROADWAY_INVENTORY_ID,
+    period         = "transition",
+    completion_year = NA_real_,
+    event_time     = NA_real_
+  )
+
+# Stack with existing data
+segment_year_data_full <- bind_rows(
+  segment_year_data,
+  crashes_2022_summary %>%
+    select(any_of(names(segment_year_data)))
+) %>%
+  arrange(ROADWAY_INVENTORY_ID, CRASH_YR)
+
+# Recompute event time for treated segments
+segment_year_data_full <- segment_year_data_full %>%
+  left_join(
+    ohio_all_types %>%
+      distinct(ROADWAY_INVENTORY_ID, completion_year) %>%
+      rename(comp_year = completion_year),
+    by = "ROADWAY_INVENTORY_ID"
+  ) %>%
+  mutate(
+    event_time = CRASH_YR - comp_year
+  )
+
+# Rebuild event study with 2022 included
+event_study_full <- segment_year_data_full %>%
+  filter(
+    treated_safety == TRUE,
+    !is.na(event_time),
+    event_time >= -2, event_time <= 2
+  ) %>%
+  group_by(event_time) %>%
+  summarise(
+    avg_crash_rate = mean(crash_rate_MVMT, na.rm = TRUE),
+    se             = sd(crash_rate_MVMT,   na.rm = TRUE) / sqrt(n()),
+    n_obs          = n(),
+    .groups        = "drop"
+  )
+
+as.data.frame(event_study_full)
+```
+
+```{r}
+
+completion_lookup <- analysis_df %>%
+  st_drop_geometry() %>%
+  select(ROADWAY_INVENTORY_ID, NLF_ID, CTL_BEGIN_NBR, CTL_END_NBR) %>%
+  inner_join(
+    projects_safety %>%
+      select(NLF_ID, CTL_BEGIN, CTL_END, completion_year) %>%
+      distinct(),
+    by = "NLF_ID",
+    relationship = "many-to-many"
+  ) %>%
+  filter(
+    CTL_BEGIN_NBR <= CTL_END,   # segment start <= project end
+    CTL_END_NBR   >= CTL_BEGIN  # segment end >= project start
+  ) %>%
+  group_by(ROADWAY_INVENTORY_ID) %>%
+  summarise(comp_year = min(completion_year, na.rm = TRUE),
+            .groups = "drop")
+
+# Recompute event time
+segment_year_data_full <- segment_year_data_full %>%
+  left_join(completion_lookup, by = "ROADWAY_INVENTORY_ID") %>%
+  mutate(event_time_full = CRASH_YR - comp_year)
+
+# Rebuild event study with 2022 included
+event_study_full <- segment_year_data_full %>%
+  filter(
+    treated_safety == TRUE,
+    !is.na(event_time_full),
+    event_time_full >= -2, event_time_full <= 2
+  ) %>%
+  group_by(event_time_full) %>%
+  summarise(
+    avg_crash_rate = mean(crash_rate_MVMT, na.rm = TRUE),
+    se             = sd(crash_rate_MVMT,   na.rm = TRUE) / sqrt(n()),
+    n_obs          = n(),
+    .groups        = "drop"
+  )
+
+cat("=== Event Study WITH 2022 ===\n")
+as.data.frame(event_study_full)
+
+cat("\n=== Original Event Study (without 2022) ===\n")
+data.frame(
+  event_time     = c(-2, -1, 0, 1, 2),
+  avg_crash_rate = c(8.10, 7.64, 6.74, 6.80, 7.42)
+)
+```
+
+```{r}
+#####################
+### Testing Clusters
+#####################
+
+# Step 1 — create balanced_segments_nlf
+balanced_segments_nlf <- balanced_segments %>%
+  left_join(
+    analysis_df %>%
+      st_drop_geometry() %>%
+      select(ROADWAY_INVENTORY_ID, NLF_ID, COUNTY_CD.x),
+    by = "ROADWAY_INVENTORY_ID"
+  )
+
+# Step 2 — all three models
+did_segment <- felm(log_crash_rate ~ treated_safety * I(period == "after") |
+                      ROADWAY_INVENTORY_ID + CRASH_YR | 0 |
+                      ROADWAY_INVENTORY_ID,
+                    data = balanced_segments_nlf %>%
+                      filter(is.finite(log_crash_rate)))
+
+did_nlf <- felm(log_crash_rate ~ treated_safety * I(period == "after") |
+                  ROADWAY_INVENTORY_ID + CRASH_YR | 0 |
+                  NLF_ID,
+                data = balanced_segments_nlf %>%
+                  filter(is.finite(log_crash_rate)))
+
+did_county <- felm(log_crash_rate ~ treated_safety * I(period == "after") |
+                     ROADWAY_INVENTORY_ID + CRASH_YR | 0 |
+                     COUNTY_CD.x,
+                   data = balanced_segments_nlf %>%
+                     filter(is.finite(log_crash_rate)))
+
+# Step 3 — compare
+data.frame(
+  clustering = c("Segment", "NLF_ID", "County"),
+  estimate   = c(
+    coef(did_segment)["treated_safetyTRUE:I(period == \"after\")TRUE"],
+    coef(did_nlf)["treated_safetyTRUE:I(period == \"after\")TRUE"],
+    coef(did_county)["treated_safetyTRUE:I(period == \"after\")TRUE"]
+  ),
+  se         = c(
+    did_segment$cse["treated_safetyTRUE:I(period == \"after\")TRUE"],
+    did_nlf$cse["treated_safetyTRUE:I(period == \"after\")TRUE"],
+    did_county$cse["treated_safetyTRUE:I(period == \"after\")TRUE"]
+  )
+) %>%
+  mutate(p_value = round(2 * pnorm(-abs(estimate / se)), 3))
+```
+
+```{r}
+
+# Rebuild treated_flag
+treated_flag <- segment_year_data %>%
+  st_drop_geometry() %>%
+  distinct(ROADWAY_INVENTORY_ID, treated_safety)
+
+# Rebuild analysis_app
+analysis_app <- analysis_df %>%
+  st_drop_geometry() %>%
+  select(
+    ROADWAY_INVENTORY_ID, NLF_ID, COUNTY_CD.x,
+    FUNCTION_CLASS_CD, ADT_TOTAL_NBR, SPEED_LIMIT_NBR,
+    SEGMENT_LENGTH_NBR, LANES_NBR, PCR_NBR, AVG_IRI,
+    total_crashes, fatal_crashes, injury_crashes,
+    crashes_per_MVMT, treated
+  ) %>%
+  left_join(treated_flag, by = "ROADWAY_INVENTORY_ID")
+
+# Rebuild segment_year_app
+segment_year_app <- segment_year_data %>%
+  st_drop_geometry() %>%
+  select(
+    ROADWAY_INVENTORY_ID, CRASH_YR, period,
+    yearly_crashes, yearly_fatal, yearly_injury,
+    crash_rate_MVMT, treated_safety, completion_year,
+    ADT_TOTAL_NBR, SEGMENT_LENGTH_NBR, MVMT
+  )
+
+# Rebuild projects_app
+projects_app <- projects_safety %>%
+  select(
+    NLF_ID, CTL_BEGIN, CTL_END, completion_year,
+    PRIMARY_WORK_CATEGORY, EST_TOTAL_CONSTR_COST,
+    PROJECT_NME, COUNTY_NME, DISTRICT_NBR,
+    SAFETY_FUNDS_IND
+  ) %>%
+  distinct()
+
+# Rebuild county_summary
+county_summary <- analysis_app %>%
+  left_join(
+    projects_app %>%
+      select(NLF_ID, EST_TOTAL_CONSTR_COST) %>%
+      group_by(NLF_ID) %>%
+      summarise(total_cost = sum(EST_TOTAL_CONSTR_COST,
+                                 na.rm = TRUE),
+                .groups = "drop"),
+    by = "NLF_ID"
+  ) %>%
+  group_by(COUNTY_CD.x, FUNCTION_CLASS_CD) %>%
+  summarise(
+    n_segments       = n(),
+    n_treated        = sum(treated_safety, na.rm = TRUE),
+    total_crashes    = sum(total_crashes, na.rm = TRUE),
+    total_fatalities = sum(fatal_crashes, na.rm = TRUE),
+    avg_crash_rate   = mean(crashes_per_MVMT, na.rm = TRUE),
+    total_funding    = sum(total_cost, na.rm = TRUE),
+    .groups          = "drop"
+  ) %>%
+  group_by(COUNTY_CD.x) %>%
+  mutate(
+    pct_funding    = round(100 * total_funding /
+                             sum(total_funding, na.rm = TRUE), 1),
+    pct_fatalities = round(100 * total_fatalities /
+                             sum(total_fatalities, na.rm = TRUE), 1),
+    pct_segments   = round(100 * n_treated / n_segments, 1)
+  ) %>%
+  ungroup()
+
+# Save everything
+saveRDS(analysis_app,     "app_data/analysis_app.rds")
+saveRDS(segment_year_app, "app_data/segment_year_app.rds")
+saveRDS(projects_app,     "app_data/projects_app.rds")
+saveRDS(county_summary,   "app_data/county_summary.rds")
+
+message("All app data saved successfully")
+```
+
+### Making the App
+
+```{r}
+# Create app folder structure
+dir.create("odot_app", showWarnings = FALSE)
+dir.create("odot_app/app_data", showWarnings = FALSE)
+
+# Copy all data files into app folder
+file.copy(list.files("app_data", full.names = TRUE),
+          "odot_app/app_data/",
+          overwrite = TRUE)
+
+message("App data copied to odot_app/app_data/")
+
+```
+
+Current issues:
+
+not displaying the right info for the projects - fixed
+
+can't see if there is a certain type of project for a county before selecting it - fixed
+
+needs an option for all counties - fixed
+
+map controls don't seem to work and counties are not very clear (map kinda sucks in its current form...) - just decided to nuke it
+
+need to make the county dashboard display on the page better - I understand the problem
+
+need road names with the segment, or some way to view the segments on a map - yes kinda fixed\
+
+move the map for the risk explorer to right under the filter section
+
+the ADT sort is not working right.
+
+remove really short segments with ungodly high crash rates from the risk analysis tab? maybe make a box you can check to turn them on or off.
+
+find a substitution for the overview map only if it can add a level of significant important or be interesting/cool.
+
+get started on presentation. build a background, show results, create a story, and use the app to demonstrate it's use.
+
+```{r}
+
+```
+
+```{r}
+############################################
+### ODOT Safety Investment Analyzer
+### Shiny App — app.R
+############################################
+
+library(shiny)
+library(shinydashboard)
+library(tidyverse)
+library(sf)
+library(leaflet)
+library(patchwork)
+library(scales)
+library(ggplot2)
+library(DT)
+
+# ── Load data ─────────────────────────────────────────────────────────────────
+analysis_app             <- readRDS("app_data/analysis_app.rds")
+segment_year_app         <- readRDS("app_data/segment_year_app.rds")
+projects_app             <- readRDS("app_data/projects_app.rds")
+county_summary           <- readRDS("app_data/county_summary.rds")
+segments_geo             <- readRDS("app_data/segments_geo.rds")
+project_segment_lookup   <- readRDS("app_data/project_segment_lookup.rds")
+
+# ── County name lookup ────────────────────────────────────────────────────────
+county_name_lookup <- analysis_app %>%
+  left_join(
+    projects_app %>%
+      select(COUNTY_NME) %>%
+      distinct() %>%
+      mutate(COUNTY_CD.x = toupper(substr(COUNTY_NME, 1, 3))),
+    by = "COUNTY_CD.x"
+  ) %>%
+  distinct(COUNTY_CD.x, COUNTY_NME) %>%
+  filter(!is.na(COUNTY_NME)) %>%
+  mutate(display = paste0(COUNTY_CD.x, " — ", COUNTY_NME)) %>%
+  arrange(COUNTY_CD.x)
+
+county_choices <- setNames(
+  c("ALL", county_name_lookup$COUNTY_CD.x),
+  c("Statewide — All Ohio", county_name_lookup$display)
+)
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+COL_ORANGE <- "#f0883e"
+COL_BLUE   <- "#58a6ff"
+COL_GREEN  <- "#3fb950"
+COL_RED    <- "#f85149"
+COL_YELLOW <- "#d29922"
+COL_MUTED  <- "#8b949e"
+
+##county_choices <- sort(unique(analysis_app$COUNTY_CD.x))
+
+fc_labels <- c(
+  "1" = "FC1: Interstate",
+  "2" = "FC2: Freeway",
+  "3" = "FC3: Major Arterial",
+  "4" = "FC4: Minor Arterial",
+  "5" = "FC5: Collector",
+  "6" = "FC6: Minor Collector",
+  "7" = "FC7: Local"
+)
+
+theme_odot <- function(base_size = 16) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      plot.background   = element_rect(fill = "#F0F4F8", color = NA),
+      panel.background  = element_rect(fill = "#FFFFFF", color = NA),
+      panel.grid.major  = element_line(color = "#D1DCE8", linewidth = 0.4),
+      panel.grid.minor  = element_blank(),
+      text              = element_text(color = "#0D1B2A", size = base_size),
+      axis.text         = element_text(color = "#1A2E45", size = base_size - 2),
+      axis.title        = element_text(color = "#1A2E45", size = base_size - 1),
+      plot.title        = element_text(color = "#0D1B2A", face = "bold",
+                                       size = base_size + 4),
+      plot.subtitle     = element_text(color = "#1A2E45", size = base_size),
+      plot.caption      = element_text(color = "#7A9BB5", size = base_size - 3),
+      legend.background = element_rect(fill = "#F0F4F8", color = NA),
+      legend.text       = element_text(color = "#1A2E45", size = base_size - 2),
+      legend.title      = element_text(color = "#1A2E45", size = base_size - 1),
+      strip.text        = element_text(color = "#0D1B2A", size = base_size - 1)
+    )
+}
+
+# ── Pre-build road name lookup from analysis_app ──────────────────────────────
+road_name_lookup <- analysis_app %>%
+  select(ROADWAY_INVENTORY_ID, NLF_ID) %>%
+  left_join(
+    projects_app %>%
+      select(NLF_ID, PROJECT_NME) %>%
+      distinct(),
+    by = "NLF_ID"
+  ) %>%
+  distinct(ROADWAY_INVENTORY_ID, .keep_all = TRUE)
+
+# ── Pre-build segment crash data lookup ───────────────────────────────────────
+seg_crash_lookup <- segment_year_app %>%
+  group_by(ROADWAY_INVENTORY_ID) %>%
+  summarise(
+    before_rate = mean(crash_rate_MVMT[period == "before"], na.rm = TRUE),
+    after_rate  = mean(crash_rate_MVMT[period == "after"],  na.rm = TRUE),
+    .groups     = "drop"
+  ) %>%
+  mutate(has_data = !is.na(before_rate) | !is.na(after_rate))
+
+############################################
+### UI
+############################################
+
+ui <- dashboardPage(
+  skin = "black",
+
+  dashboardHeader(title = "ODOT Safety Analyzer"),
+
+  dashboardSidebar(
+    sidebarMenu(
+      menuItem("County Dashboard",  tabName = "county",  icon = icon("chart-bar")),
+      menuItem("Project Evaluator", tabName = "project", icon = icon("search")),
+      menuItem("Risk Explorer",     tabName = "risk",    icon = icon("exclamation-triangle")),
+      menuItem("Funding Gap", tabName = "funding", icon = icon("chart-pie")),
+      menuItem("Cost Effectiveness", tabName = "cost", icon = icon("dollar-sign")),
+      menuItem("Methodology",       tabName = "methods", icon = icon("info-circle"))
+    )
+  ),
+
+  dashboardBody(
+    tags$head(
+      tags$style(HTML("
+        .content-wrapper, .main-sidebar, .main-header .logo,
+        .main-header .navbar { background-color: #0d1117 !important; }
+        .skin-black .main-sidebar { background-color: #161b22 !important; }
+        .skin-black .sidebar-menu > li.active > a,
+        .skin-black .sidebar-menu > li:hover > a {
+          border-left-color: #58a6ff !important; }
+        .box { background: #161b22 !important;
+               border-top-color: #58a6ff !important; }
+        .box-header { color: #e6edf3 !important; }
+        body { background-color: #0d1117 !important;
+               color: #e6edf3 !important; }
+        .selectize-input, .selectize-dropdown {
+          background: #1c2128 !important;
+          color: #e6edf3 !important; }
+        table.dataTable thead th { color: #e6edf3 !important; }
+        table.dataTable tbody td { color: #e6edf3 !important; }
+        table.dataTable tbody tr { background-color: #161b22 !important; }
+        table.dataTable tbody tr.odd  { background-color: #1c2128 !important; }
+        table.dataTable tbody tr.even { background-color: #161b22 !important; }
+        .dataTables_wrapper .dataTables_length label,
+        .dataTables_wrapper .dataTables_filter label,
+        .dataTables_wrapper .dataTables_info { color: #e6edf3 !important; }
+        .dataTables_wrapper .dataTables_paginate .paginate_button {
+          color: #e6edf3 !important; }
+        .small-box { border-radius: 6px !important; }
+        .value-box-text { font-size: 13px !important; }
+      "))
+    ),
+
+    tabItems(
+
+      # ── Tab 1: County Dashboard ────────────────────────────────────────────
+      tabItem(tabName = "county",
+        fluidRow(
+          box(width = 3, title = "Select County",
+            selectInput("county_select", "County:",
+            choices  = county_choices,
+            selected = "ALL"),
+            hr(),
+            valueBoxOutput("vbox_segments",   width = 12),
+            valueBoxOutput("vbox_fatalities",  width = 12),
+            valueBoxOutput("vbox_treated",     width = 12),
+            hr(),
+            p("Color guide:", style = "color:#8b949e; margin-bottom:4px;"),
+            p("🔵 Interstate / Freeway", style = "color:#58a6ff; font-size:16px; margin:2px;"),
+            p("🟡 Major Arterial",       style = "color:#d29922; font-size:16px; margin:2px;"),
+            p("🔴 Minor Art. / Collector", style = "color:#f85149; font-size:16px; margin:2px;"),
+            p("🟠 Minor Col. / Local",   style = "color:#f0883e; font-size:16px; margin:2px;")
+          ),
+          box(width = 9, title = textOutput("county_dashboard_title"),
+            fluidRow(
+              column(6, plotOutput("p_bar",     height = "380px")),
+              column(6, plotOutput("p_fatal",   height = "380px"))
+            ),
+            fluidRow(
+              column(6, plotOutput("p_funding", height = "380px")),
+              column(6, plotOutput("p_bubble",  height = "380px"))
+            )
+          )
+        )
+      ),
+
+      # ── Tab 2: Project Evaluator ───────────────────────────────────────────
+      tabItem(tabName = "project",
+  fluidRow(
+    box(width = 3, title = "Select Project",
+      radioButtons("proj_view", "View Mode:",
+                   choices  = c("Individual Project" = "individual",
+                                "Project Type Trend" = "aggregate"),
+                   selected = "individual"),
+      hr(),
+      selectInput("proj_scope", "Geography:",
+                  choices  = c("Statewide", "By County"),
+                  selected = "Statewide"),
+      conditionalPanel(
+        condition = "input.proj_scope == 'By County'",
+        selectInput("proj_county", "County:",
+                    choices  = county_choices,
+                    selected = "HAM")
+      ),
+      uiOutput("proj_category_ui"),
+      conditionalPanel(
+        condition = "input.proj_view == 'individual'",
+        uiOutput("proj_name_ui")
+      ),
+      hr(),
+      verbatimTextOutput("proj_details")
+    ),
+    box(width = 9, title = "Project Analysis",
+      plotOutput("project_plot", height = "700px")
+    )
+  )
+),
+
+      # ── Tab 3: Risk Explorer ───────────────────────────────────────────────
+       tabItem(tabName = "risk",
+        fluidRow(
+          box(width = 3, title = "Filters",
+            selectInput("risk_county", "County:",
+                        choices  = county_choices,
+                        selected = "HAM"),
+            selectInput("risk_fc", "Road Class:",
+                        choices  = c("All", names(fc_labels)),
+                        selected = "All"),
+            sliderInput("risk_n", "Show top N segments:",
+                        min = 10, max = 100, value = 25, step = 5),
+            hr(),
+            sliderInput("risk_min_length",
+                        "Minimum segment length (miles):",
+                        min = 0, max = 2, value = 0.1,
+                        step = 0.05),
+            checkboxInput("risk_exclude_short",
+                          "Exclude very short segments (< min length)",
+                          value = TRUE),
+            hr(),
+            p("Click any row to see segment on map.",
+              style = "color:#8b949e; font-size:16px;"),
+            leafletOutput("risk_map", height = "280px")
+          ),
+          box(width = 9, title = "Highest Risk Untreated Segments",
+            DTOutput("risk_table")
+          )
+        )
+      ),
+
+      # ── Tab 4: Funding Gap ─────────────────────────────────────────────────
+      tabItem(tabName = "funding",
+        fluidRow(
+          box(width = 3, title = "Filters",
+            selectInput("fund_scope", "View:",
+                        choices  = c("Statewide", "By County"),
+                        selected = "Statewide"),
+            conditionalPanel(
+              condition = "input.fund_scope == 'By County'",
+              selectInput("fund_county", "County:",
+                          choices  = county_choices,
+                          selected = "HAM")
+            ),
+            selectInput("fund_metric", "X Axis Metric:",
+                        choices = c(
+                          "% of Funding"          = "pct_funding",
+                          "% of Segments Treated" = "pct_segments"
+                        ))
+          ),
+          box(width = 9, title = "Investment Gap Analysis",
+            plotOutput("funding_plot", height = "700px")
+          )
+        )
+      ),
+
+
+     # ── Tab 5: Cost Effectiveness ──────────────────────────────────────────
+      tabItem(tabName = "cost",
+        fluidRow(
+          box(width = 3, title = "Filters",
+            selectInput("cost_scope", "Geography:",
+                        choices  = c("Statewide", "By County"),
+                        selected = "Statewide"),
+            conditionalPanel(
+              condition = "input.cost_scope == 'By County'",
+              selectInput("cost_county", "County:",
+                          choices  = county_choices,
+                          selected = "HAM")
+            ),
+            selectInput("cost_fc", "Road Class:",
+                        choices = c("All", names(fc_labels)),
+                        selected = "All"),
+            hr(),
+            p("Each bubble is one project.",
+              style = "color:#8b949e; font-size:14px;"),
+            p("X axis: total project cost.",
+              style = "color:#8b949e; font-size:14px;"),
+            p("Y axis: avg crash rate change after completion.",
+              style = "color:#8b949e; font-size:14px;"),
+            p("Bubble size: number of matched segments.",
+              style = "color:#8b949e; font-size:14px;"),
+            hr(),
+            p("🟢 Meaningful improvement (> -0.5)",
+              style = "color:#3fb950; font-size:14px;"),
+            p("🔴 Meaningful worsening (> +0.5)",
+              style = "color:#f85149; font-size:14px;"),
+            p("⚫ Negligible change (within ±0.5)",
+              style = "color:#8b949e; font-size:14px;")
+          ),
+          box(width = 9, title = "Cost vs Effectiveness",
+            plotOutput("cost_plot", height = "650px")
+          )
+        )
+      ),
+
+
+      # ── Tab 6: Methodology ─────────────────────────────────────────────────
+      tabItem(tabName = "methods",
+        fluidRow(
+          box(width = 12, title = "About This Analysis",
+            h4("Data Sources", style = "color:#58a6ff"),
+            p("This tool combines four ODOT datasets spanning 2020–2024:"),
+            tags$ul(
+              tags$li("Crash Records — ~910,000 events spatially joined to road segments"),
+              tags$li("Road Inventory — 328,709 segments with physical characteristics"),
+              tags$li("Pavement Condition (PCR) — most recent inspection per segment"),
+              tags$li("Construction Projects — 13,550 safety-funded projects")
+            ),
+            hr(),
+            h4("Analytical Approach", style = "color:#58a6ff"),
+            p("The core analysis uses a difference-in-differences (DiD) design,
+              comparing crash rate changes on safety-funded segments to comparable
+              untreated segments over the same period. Treatment and control roads
+              are matched by ADT range (10th–90th percentile of treated segments).
+              Models include segment and year fixed effects with standard errors
+              clustered at the segment level."),
+            hr(),
+            h4("Key Finding", style = "color:#58a6ff"),
+            p("Safety-funded projects show no statistically significant overall
+              crash reduction (DiD coefficient: +0.014, p = 0.185). Intersection
+              improvements are the one project type showing consistent crash
+              reductions (~6.5 crashes per MVMT). Local and collector roads
+              account for over 50% of Ohio fatalities but receive less than 15%
+              of safety funding."),
+            hr(),
+            p("Developed by Xavier University Senior Capstone, 2025–2026.",
+              style = "color:#8b949e; font-style:italic")
+          )
+        )
+      )
+    )
+  )
+)
+
+############################################
+### SERVER
+############################################
+
+server <- function(input, output, session) {
+
+  # ── Tab 1: County Dashboard ──────────────────────────────────────────────
+   county_data <- reactive({
+    if (input$county_select == "ALL") {
+      county_summary %>%
+        group_by(FUNCTION_CLASS_CD) %>%
+        summarise(
+          n_segments       = sum(n_segments),
+          n_treated        = sum(n_treated),
+          total_crashes    = sum(total_crashes),
+          total_fatalities = sum(total_fatalities),
+          avg_crash_rate   = mean(avg_crash_rate, na.rm = TRUE),
+          total_funding    = sum(total_funding),
+          .groups          = "drop"
+        ) %>%
+        mutate(
+          pct_fatalities = round(100 * total_fatalities /
+                                   sum(total_fatalities), 1),
+          pct_funding    = round(100 * total_funding /
+                                   sum(total_funding), 1),
+          pct_segments   = round(100 * n_treated / n_segments, 1),
+          COUNTY_CD.x    = "ALL",
+          fc_label       = fc_labels[as.character(FUNCTION_CLASS_CD)],
+          bar_color      = case_when(
+            FUNCTION_CLASS_CD %in% c(1, 2) ~ COL_BLUE,
+            FUNCTION_CLASS_CD == 3          ~ COL_YELLOW,
+            FUNCTION_CLASS_CD %in% c(4, 5) ~ COL_RED,
+            TRUE                            ~ COL_ORANGE
+          )
+        ) %>%
+        filter(!is.na(fc_label))
+    } else {
+      county_summary %>%
+        filter(COUNTY_CD.x == input$county_select) %>%
+        mutate(
+          fc_label  = fc_labels[as.character(FUNCTION_CLASS_CD)],
+          bar_color = case_when(
+            FUNCTION_CLASS_CD %in% c(1, 2) ~ COL_BLUE,
+            FUNCTION_CLASS_CD == 3          ~ COL_YELLOW,
+            FUNCTION_CLASS_CD %in% c(4, 5) ~ COL_RED,
+            TRUE                            ~ COL_ORANGE
+          )
+        ) %>%
+        filter(!is.na(fc_label))
+    }
+  })
+   
+    output$county_dashboard_title <- renderText({
+    if (input$county_select == "ALL") {
+      "Ohio Statewide — Safety Profile"
+    } else {
+      name <- county_name_lookup$COUNTY_NME[
+        county_name_lookup$COUNTY_CD.x == input$county_select
+      ]
+      paste0(name, " County — Safety Profile")
+    }
+  })
+
+  output$vbox_segments <- renderValueBox({
+    d <- county_data()
+    valueBox(
+      value    = scales::comma(sum(d$n_segments)),
+      subtitle = "Total Road Segments",
+      icon     = icon("road"),
+      color    = "blue",
+      width    = 12
+    )
+  })
+
+  output$vbox_fatalities <- renderValueBox({
+    d <- county_data()
+    valueBox(
+      value    = scales::comma(sum(d$total_fatalities)),
+      subtitle = "Fatalities 2020-2024",
+      icon     = icon("exclamation-triangle"),
+      color    = "red",
+      width    = 12
+    )
+  })
+
+  output$vbox_treated <- renderValueBox({
+    d <- county_data()
+    pct <- round(100 * sum(d$n_treated) / sum(d$n_segments), 1)
+    valueBox(
+      value    = paste0(pct, "%"),
+      subtitle = "Segments w/ Investment",
+      icon     = icon("wrench"),
+      color    = "yellow",
+      width    = 12
+    )
+  })
+
+  # Individual plots for better layout control
+  output$p_bar <- renderPlot({
+    d <- county_data()
+    req(nrow(d) > 0)
+    ggplot(d, aes(x = reorder(fc_label, avg_crash_rate),
+                  y = avg_crash_rate, fill = bar_color)) +
+      geom_col(width = 0.6, alpha = 0.85) +
+      geom_text(aes(label = round(avg_crash_rate, 1)),
+                hjust = -0.2, color = "#0d1117", size = 5.5) +
+      scale_fill_identity() +
+      scale_y_continuous(limits = c(0, max(d$avg_crash_rate) * 1.3)) +
+      coord_flip() +
+      labs(title = "Crash Rate by Road Class",
+           x = NULL, y = "Crashes per MVMT") +
+      theme_odot()
+  }, bg = "#0d1117")
+
+  output$p_fatal <- renderPlot({
+    d <- county_data()
+    req(nrow(d) > 0)
+    ggplot(d, aes(x = reorder(fc_label, pct_fatalities),
+                  y = pct_fatalities, fill = bar_color)) +
+      geom_col(width = 0.6, alpha = 0.85) +
+      geom_text(aes(label = paste0(round(pct_fatalities, 1), "%")),
+                hjust = -0.2, color = "#0d1117", size = 5.5) +
+      scale_fill_identity() +
+      scale_y_continuous(limits = c(0, max(d$pct_fatalities) * 1.3)) +
+      coord_flip() +
+      labs(title = "Share of Fatalities",
+           x = NULL, y = "% of County Fatalities") +
+      theme_odot()
+  }, bg = "#0d1117")
+
+  output$p_funding <- renderPlot({
+    d <- county_data()
+    req(nrow(d) > 0)
+    ggplot(d, aes(x = reorder(fc_label, pct_funding),
+                  y = pct_funding, fill = bar_color)) +
+      geom_col(width = 0.6, alpha = 0.85) +
+      geom_text(aes(label = paste0(round(pct_funding, 1), "%")),
+                hjust = -0.2, color = "#0d1117", size = 5.5) +
+      scale_fill_identity() +
+      scale_y_continuous(limits = c(0, max(d$pct_funding) * 1.3)) +
+      coord_flip() +
+      labs(title = "Share of Safety Funding",
+           x = NULL, y = "% of Total Safety Funding") +
+      theme_odot()
+  }, bg = "#0d1117")
+
+  output$p_bubble <- renderPlot({
+    d <- county_data()
+    req(nrow(d) > 0)
+    ggplot(d, aes(x = pct_funding, y = avg_crash_rate,
+                  size = pct_fatalities, fill = bar_color)) +
+      geom_point(shape = 21, alpha = 0.85,
+                 color = "#0d1117", stroke = 1.5) +
+      geom_text(aes(label = fc_label),
+                vjust = -1.5, size = 5.0, color = "#0d1117") +
+      scale_fill_identity() +
+      scale_size_continuous(range = c(4, 14), name = "% Fatalities") +
+      scale_x_continuous(labels = scales::percent_format(scale = 1)) +
+      labs(title    = "Investment Gap",
+           subtitle = "Bubble = share of fatalities",
+           x = "% of Safety Funding",
+           y = "Crash Rate (per MVMT)") +
+      theme_odot() +
+      theme(legend.position = "none")
+  }, bg = "#0d1117")
+
+  # ── Tab 2: Project Evaluator ─────────────────────────────────────────────
+
+  # Pre-computed project data availability
+  proj_available <- reactive({
+    if (input$proj_scope == "By County") {
+      project_segment_lookup %>%
+        filter(grepl(input$proj_county, COUNTY_NME, 
+                     ignore.case = TRUE))
+    } else {
+      project_segment_lookup
+    }
+  })
+
+  proj_filtered <- reactive({
+    p <- proj_available()
+    if (!is.null(input$proj_category) && 
+        input$proj_category != "All") {
+      p <- p %>% 
+        filter(PRIMARY_WORK_CATEGORY == input$proj_category)
+    }
+    p
+  })
+
+  output$proj_category_ui <- renderUI({
+    base <- proj_available()
+
+    counts <- base %>%
+      group_by(PRIMARY_WORK_CATEGORY) %>%
+      summarise(
+        n_projects = n_distinct(PROJECT_NME),
+        n_segments = n(),
+        .groups    = "drop"
+      ) %>%
+      arrange(desc(n_projects)) %>%
+      mutate(label = paste0(PRIMARY_WORK_CATEGORY,
+                            " (", n_projects, " projects)"))
+
+    total <- n_distinct(base$PROJECT_NME)
+
+    choices <- c(
+      setNames("All", paste0("All (", total, " projects)")),
+      setNames(counts$PRIMARY_WORK_CATEGORY, counts$label)
+    )
+
+    selectInput("proj_category", "Project Type:",
+                choices  = choices,
+                selected = "All")
+  })
+
+  output$proj_name_ui <- renderUI({
+    choices <- sort(unique(proj_filtered()$PROJECT_NME))
+    if (length(choices) == 0) return(NULL)
+    selectInput("proj_name", "Project:", choices = choices)
+  })
+
+  output$proj_details <- renderText({
+    if (input$proj_view == "aggregate") return("")
+    req(input$proj_name)
+    p <- proj_filtered() %>%
+      filter(PROJECT_NME == input$proj_name) %>%
+      slice(1)
+    if (nrow(p) == 0) return("")
+    n_segs <- proj_filtered() %>%
+      filter(PROJECT_NME == input$proj_name) %>%
+      nrow()
+    paste0(
+      "Category:   ", p$PRIMARY_WORK_CATEGORY, "\n",
+      "Completion: ", p$completion_year, "\n",
+      "County:     ", p$COUNTY_NME, "\n",
+      "Est. Cost:  $", scales::comma(p$EST_TOTAL_CONSTR_COST), "\n",
+      "Segments:   ", n_segs, " matched"
+    )
+  })
+
+  output$project_plot <- renderPlot({
+
+    # ── AGGREGATE MODE ───────────────────────────────────────────────────
+     if (input$proj_view == "aggregate") {
+      req(input$proj_category)
+      if (is.null(input$proj_category)) return(NULL)
+
+     # If All selected use all segments, otherwise filter by type
+      if (input$proj_category == "All") {
+        base_data <- proj_available()
+        type_label <- "All Project Types Combined"
+      } else {
+        base_data <- proj_available() %>%
+          filter(PRIMARY_WORK_CATEGORY == input$proj_category)
+        type_label <- input$proj_category
+      }
+
+       # base_data already set above
+
+      if (nrow(base_data) == 0) {
+        return(
+          ggplot() +
+            annotate("text", x = 0.5, y = 0.5,
+                     label = paste0("No projects found for\n",
+                                    input$proj_category,
+                                    "\nin selected geography."),
+                     color = COL_MUTED, size = 6,
+                     hjust = 0.5, vjust = 0.5) +
+            theme_void() +
+            theme(plot.background = element_rect(fill = "#0d1117",
+                                                 color = NA))
+        )
+      }
+
+      agg_segs <- base_data %>%
+        pull(ROADWAY_INVENTORY_ID) %>%
+        unique()
+
+      completion_lookup <- base_data %>%
+        distinct(ROADWAY_INVENTORY_ID, completion_year)
+
+      agg_data <- segment_year_app %>%
+        filter(ROADWAY_INVENTORY_ID %in% agg_segs) %>%
+        select(-any_of("completion_year")) %>%
+        left_join(completion_lookup, by = "ROADWAY_INVENTORY_ID") %>%
+        mutate(event_time = CRASH_YR - completion_year) %>%
+        filter(event_time >= -2, event_time <= 2) %>%
+        group_by(event_time) %>%
+        summarise(
+          avg_rate   = mean(crash_rate_MVMT, na.rm = TRUE),
+          se         = sd(crash_rate_MVMT, na.rm = TRUE) / sqrt(n()),
+          n_segments = n_distinct(ROADWAY_INVENTORY_ID),
+          .groups    = "drop"
+        )
+
+      if (nrow(agg_data) == 0) {
+        return(
+          ggplot() +
+            annotate("text", x = 0.5, y = 0.5,
+                     label = "No data available for this project type.",
+                     color = COL_MUTED, size = 8,
+                     hjust = 0.5, vjust = 0.5) +
+            theme_void() +
+            theme(plot.background = element_rect(fill = "#0d1117",
+                                                 color = NA))
+        )
+      }
+
+      before_avg <- mean(agg_data$avg_rate[agg_data$event_time < 0],
+                         na.rm = TRUE)
+      after_avg  <- mean(agg_data$avg_rate[agg_data$event_time >= 0],
+                         na.rm = TRUE)
+      chg        <- round(after_avg - before_avg, 2)
+      chg_label  <- ifelse(chg < 0,
+                           paste0("▼ ", abs(chg), " per MVMT"),
+                           paste0("▲ ", abs(chg), " per MVMT"))
+      chg_color  <- case_when(
+  chg < -0.5  ~ COL_GREEN,   # meaningful improvement
+  chg >  0.5  ~ COL_RED,     # meaningful worsening
+  TRUE        ~ COL_MUTED    # negligible change — gray
+)
+line_color <- chg_color
+          n_proj <- n_distinct(base_data$PROJECT_NME)
+      scope_label <- if (input$proj_scope == "Statewide") {
+        "Ohio Statewide"
+      } else {
+        paste0(input$proj_county, " County")
+      }
+
+      ggplot(agg_data, aes(x = event_time, y = avg_rate)) +
+        geom_ribbon(aes(ymin = avg_rate - 1.96 * se,
+                        ymax = avg_rate + 1.96 * se),
+                    fill = line_color, alpha = 0.15) +
+        geom_line(color = line_color, linewidth = 1.3) +
+        geom_point(color = line_color, size = 4) +
+        geom_vline(xintercept = 0, linetype = "dashed",
+                   color = COL_ORANGE, linewidth = 0.8) +
+        annotate("text", x = 0.1,
+                 y = max(agg_data$avg_rate +
+                           1.96 * agg_data$se, na.rm = TRUE) * 0.97,
+                 label = "Completion",
+                 color = COL_ORANGE, hjust = 0, size = 5.5) +
+        annotate("label",
+                 x     = -1.5,
+                 y     = max(agg_data$avg_rate +
+                               1.96 * agg_data$se, na.rm = TRUE) * 0.6,
+                 label = paste0(
+                   "Before avg: ", round(before_avg, 1), "\n",
+                   "After avg:  ", round(after_avg,  1), "\n",
+                   "Change:     ", chg_label, "\n",
+                   "Projects:   ", n_proj, "\n",
+                   "Segments:   ", max(agg_data$n_segments)),
+                 fill          = "#1c2128",
+                 color         = chg_color,
+                 size          = 5,
+                 linewidth     = 0,
+                 label.padding = unit(0.4, "lines"),
+                 hjust         = 0) +
+        scale_x_continuous(breaks = -2:2,
+                           labels = c("-2", "-1", "0\n(Completion)",
+                                      "+1", "+2")) +
+        labs(
+          title    = paste0(type_label, " — Aggregate Trend"),
+        subtitle = paste0(scope_label,
+                          " | 95% CI shown | n = ", n_proj,
+                          " projects"),
+          x        = "Years Relative to Completion",
+          y        = "Avg Crash Rate (per MVMT)",
+          caption  = "Source: ODOT Construction Projects & Crash Data 2020–2024"
+        ) +
+        theme_odot()
+
+    # ── INDIVIDUAL MODE ──────────────────────────────────────────────────
+    } else {
+      req(input$proj_name)
+
+      proj_segs <- proj_filtered() %>%
+        filter(PROJECT_NME == input$proj_name)
+
+      if (nrow(proj_segs) == 0) {
+        return(
+          ggplot() +
+            annotate("text", x = 0.5, y = 0.5,
+                     label = "No data available for this project.",
+                     color = COL_MUTED, size = 8,
+                     hjust = 0.5, vjust = 0.5) +
+            theme_void() +
+            theme(plot.background = element_rect(fill = "#0d1117",
+                                                 color = NA))
+        )
+      }
+
+      seg_ids   <- proj_segs$ROADWAY_INVENTORY_ID
+      proj_info <- proj_segs %>% slice(1)
+      comp_year <- proj_info$completion_year
+
+      plot_data <- segment_year_app %>%
+        filter(ROADWAY_INVENTORY_ID %in% seg_ids) %>%
+        group_by(CRASH_YR) %>%
+        summarise(
+          avg_rate = mean(crash_rate_MVMT, na.rm = TRUE),
+          n_segs   = n_distinct(ROADWAY_INVENTORY_ID),
+          .groups  = "drop"
+        )
+
+      if (nrow(plot_data) == 0 || all(is.na(plot_data$avg_rate))) {
+        return(
+          ggplot() +
+            annotate("text", x = 0.5, y = 0.5,
+                     label = paste0("No crash data found for\n",
+                                    input$proj_name),
+                     color = COL_MUTED, size = 8,
+                     hjust = 0.5, vjust = 0.5) +
+            theme_void() +
+            theme(plot.background = element_rect(fill = "#0d1117",
+                                                 color = NA))
+        )
+      }
+
+      avg_before <- mean(proj_segs$before_rate, na.rm = TRUE)
+      avg_after  <- mean(proj_segs$after_rate,  na.rm = TRUE)
+      chg        <- round(avg_after - avg_before, 2)
+      chg_label  <- ifelse(chg < 0,
+                           paste0("▼ ", abs(chg), " per MVMT"),
+                           paste0("▲ ", abs(chg), " per MVMT"))
+      chg_color  <- case_when(
+  chg < -0.5  ~ COL_GREEN,   # meaningful improvement
+  chg >  0.5  ~ COL_RED,     # meaningful worsening
+  TRUE        ~ COL_MUTED    # negligible change — gray
+)
+line_color <- chg_color
+
+      ggplot(plot_data, aes(x = CRASH_YR, y = avg_rate)) +
+        geom_area(fill = line_color, alpha = 0.1) +
+        geom_line(color = line_color, linewidth = 1.3) +
+        geom_point(color = line_color, size = 4) +
+        geom_vline(xintercept = comp_year, linetype = "dashed",
+                   color = COL_ORANGE, linewidth = 0.8) +
+        annotate("text",
+                 x     = comp_year + 0.05,
+                 y     = max(plot_data$avg_rate, na.rm = TRUE) * 0.95,
+                 label = paste0("Completed ", comp_year),
+                 color = COL_ORANGE, hjust = 0, size = 5.5) +
+        annotate("label",
+                 x     = mean(range(plot_data$CRASH_YR)),
+                 y     = max(plot_data$avg_rate, na.rm = TRUE) * 0.5,
+                 label = paste0(
+                   "Before: ", round(avg_before, 1), "\n",
+                   "After:  ", round(avg_after,  1), "\n",
+                   "Change: ", chg_label, "\n",
+                   "Segments: ", nrow(proj_segs)),
+                 fill          = "#1c2128",
+                 color         = chg_color,
+                 size          = 5,
+                 linewidth     = 0,
+                 label.padding = unit(0.4, "lines")) +
+        scale_x_continuous(breaks = unique(plot_data$CRASH_YR)) +
+        labs(
+          title    = input$proj_name,
+          subtitle = paste0(proj_info$PRIMARY_WORK_CATEGORY,
+                            " | ", proj_info$COUNTY_NME, " County",
+                            " | Cost: $",
+                            scales::comma(proj_info$EST_TOTAL_CONSTR_COST)),
+          x        = "Year",
+          y        = "Avg Crash Rate (per MVMT)"
+        ) +
+        theme_odot()
+    }
+  }, bg = "#0d1117")
+
+  # ── Tab 3: Risk Explorer ─────────────────────────────────────────────────
+  risk_data <- reactive({
+    d <- analysis_app %>%
+      filter(COUNTY_CD.x == input$risk_county,
+             treated_safety == FALSE,
+             !is.na(crashes_per_MVMT),
+             ADT_TOTAL_NBR > 0)
+
+    # Filter out very short segments if checkbox is checked
+    if (input$risk_exclude_short) {
+      d <- d %>%
+        filter(SEGMENT_LENGTH_NBR >= input$risk_min_length)
+    }
+
+    if (input$risk_fc != "All") {
+      d <- d %>%
+        filter(FUNCTION_CLASS_CD == as.integer(input$risk_fc))
+    }
+
+    d %>%
+      arrange(desc(crashes_per_MVMT)) %>%
+      slice_head(n = input$risk_n) %>%
+      mutate(
+        fc_label      = fc_labels[as.character(FUNCTION_CLASS_CD)],
+        crash_rate    = round(crashes_per_MVMT, 1),
+        ADT_num       = ADT_TOTAL_NBR,  # keep numeric for sorting
+        ADT           = scales::comma(ADT_TOTAL_NBR),
+        length_mi     = round(SEGMENT_LENGTH_NBR, 3)
+      ) %>%
+      select(
+        `Segment ID`  = ROADWAY_INVENTORY_ID,
+        `Road/Route`  = NLF_ID,
+        `Road Class`  = fc_label,
+        `Crash Rate`  = crash_rate,
+        `Fatalities`  = fatal_crashes,
+        `ADT`         = ADT,
+        `ADT_sort`    = ADT_num,       # hidden sort column
+        `Length (mi)` = length_mi,
+        `PCR Score`   = PCR_NBR
+      )
+  })
+
+  output$risk_table <- renderDT({
+    d <- risk_data()
+    
+    # Separate display and sort columns
+    display_cols <- c("Segment ID", "Road/Route", "Road Class",
+                      "Crash Rate", "Fatalities", "ADT",
+                      "Length (mi)", "PCR Score")
+    
+    datatable(
+      d,
+      options = list(
+        pageLength = 25,
+        dom        = "frtip",
+        scrollX    = TRUE,
+        columnDefs = list(
+          list(visible = FALSE, targets = 6),  # hide ADT_sort
+          list(orderData = 6, targets = 5)     # sort ADT by ADT_sort
+        )
+      ),
+      rownames  = FALSE,
+      style     = "bootstrap",
+      selection = "single",
+      colnames  = c("Segment ID", "Road/Route", "Road Class",
+                    "Crash Rate", "Fatalities", "ADT",
+                    "ADT_sort", "Length (mi)", "PCR Score")
+    ) %>%
+      formatStyle(
+        columns    = display_cols,
+        color      = "#e6edf3",
+        background = "#161b22"
+      )
+  })
+
+  # Map under filters
+  output$risk_map <- renderLeaflet({
+    leaflet() %>%
+      addProviderTiles(providers$CartoDB.DarkMatter) %>%
+      setView(lng = -82.9, lat = 40.4, zoom = 9)
+  })
+
+  observeEvent(input$risk_table_rows_selected, {
+    row <- input$risk_table_rows_selected
+    req(row)
+
+    selected_seg <- risk_data()[row, ]$`Segment ID`
+
+    seg_geo <- segments_geo %>%
+      filter(ROADWAY_INVENTORY_ID == selected_seg) %>%
+      st_transform(4326)
+
+    if (nrow(seg_geo) > 0) {
+      center <- seg_geo %>%
+        st_centroid() %>%
+        st_coordinates()
+
+      leafletProxy("risk_map") %>%
+        clearShapes() %>%
+        addPolylines(
+          data   = seg_geo,
+          color  = COL_RED,
+          weight = 5,
+          label  = paste0(
+            "Segment: ", selected_seg, "\n",
+            "Route: ", risk_data()[row, ]$`Road/Route`
+          )
+        ) %>%
+        setView(lng = center[1], lat = center[2], zoom = 14)
+    }
+  })
+
+  # ── Tab 4: Funding Gap ───────────────────────────────────────────────────
+  output$funding_plot <- renderPlot({
+    if (input$fund_scope == "By County") {
+      d <- county_summary %>%
+        filter(COUNTY_CD.x == input$fund_county)
+    } else {
+      d <- county_summary %>%
+        group_by(FUNCTION_CLASS_CD) %>%
+        summarise(
+          n_segments       = sum(n_segments),
+          n_treated        = sum(n_treated),
+          total_crashes    = sum(total_crashes),
+          total_fatalities = sum(total_fatalities),
+          avg_crash_rate   = mean(avg_crash_rate, na.rm = TRUE),
+          total_funding    = sum(total_funding),
+          .groups          = "drop"
+        ) %>%
+        mutate(
+          pct_funding    = round(100 * total_funding /
+                                   sum(total_funding), 1),
+          pct_fatalities = round(100 * total_fatalities /
+                                   sum(total_fatalities), 1),
+          pct_segments   = round(100 * n_treated / n_segments, 1),
+          COUNTY_CD.x    = "Statewide"
+        )
+    }
+
+    d <- d %>%
+      mutate(
+        fc_label  = fc_labels[as.character(FUNCTION_CLASS_CD)],
+        bar_color = case_when(
+          FUNCTION_CLASS_CD %in% c(1, 2) ~ COL_BLUE,
+          FUNCTION_CLASS_CD == 3          ~ COL_YELLOW,
+          FUNCTION_CLASS_CD %in% c(4, 5) ~ COL_RED,
+          TRUE                            ~ COL_ORANGE
+        ),
+        x_var = if (input$fund_metric == "pct_funding")
+          pct_funding else pct_segments
+      ) %>%
+      filter(!is.na(fc_label))
+
+    ggplot(d, aes(x = x_var, y = avg_crash_rate,
+                  size = pct_fatalities, fill = bar_color)) +
+      geom_point(shape = 21, alpha = 0.85,
+                 color = "#0d1117", stroke = 1.5) +
+      geom_text(aes(label = fc_label),
+                vjust = -1.5, size = 5.5, color = "#0d1117") +
+      scale_fill_identity() +
+      scale_size_continuous(range = c(5, 20),
+                            name  = "% of Fatalities") +
+      scale_x_continuous(
+        labels = scales::percent_format(scale = 1)) +
+      labs(
+        title    = "Safety Investment Gap by Road Class",
+        subtitle = "Bubble size = share of fatalities",
+        x        = ifelse(input$fund_metric == "pct_funding",
+                          "% of Total Safety Funding",
+                          "% of Segments Receiving Investment"),
+        y        = "Avg Crash Rate (per MVMT)",
+        caption  = "Source: ODOT Construction Projects & Crash Data 2020–2024"
+      ) +
+      theme_odot()
+  }, bg = "#0d1117")
+  
+  # ── Tab 5: Cost Effectiveness ────────────────────────────────────────────
+  output$cost_plot <- renderPlot({
+
+    # Build project-level summary from lookup
+    cost_data <- project_segment_lookup %>%
+      group_by(PROJECT_NME, PRIMARY_WORK_CATEGORY,
+               COUNTY_NME, COUNTY_CD.x, completion_year,
+               EST_TOTAL_CONSTR_COST) %>%
+      summarise(
+        avg_change  = mean(change, na.rm = TRUE),
+        n_segments  = n(),
+        avg_before  = mean(before_rate, na.rm = TRUE),
+        avg_fc      = round(mean(FUNCTION_CLASS_CD, na.rm = TRUE)),
+        .groups     = "drop"
+      ) %>%
+      filter(!is.na(EST_TOTAL_CONSTR_COST),
+             EST_TOTAL_CONSTR_COST > 0,
+             !is.na(avg_change))
+
+    # Apply geography filter
+    if (input$cost_scope == "By County") {
+      cost_data <- cost_data %>%
+        filter(grepl(input$cost_county, COUNTY_NME,
+                     ignore.case = TRUE))
+    }
+
+    # Apply FC filter
+    if (input$cost_fc != "All") {
+      cost_data <- cost_data %>%
+        filter(avg_fc == as.integer(input$cost_fc))
+    }
+
+    if (nrow(cost_data) == 0) {
+      return(
+        ggplot() +
+          annotate("text", x = 0.5, y = 0.5,
+                   label = "No projects found for selected filters.",
+                   color = COL_MUTED, size = 8,
+                   hjust = 0.5, vjust = 0.5) +
+          theme_void() +
+          theme(plot.background = element_rect(fill = "#0d1117",
+                                               color = NA))
+      )
+    }
+
+    # Color by outcome
+    cost_data <- cost_data %>%
+      mutate(
+        outcome = case_when(
+          avg_change < -0.5 ~ "Improved",
+          avg_change >  0.5 ~ "Worsened",
+          TRUE              ~ "No Change"
+        ),
+        dot_color = case_when(
+          avg_change < -0.5 ~ COL_GREEN,
+          avg_change >  0.5 ~ COL_RED,
+          TRUE              ~ COL_MUTED
+        ),
+        cost_millions = EST_TOTAL_CONSTR_COST / 1e6
+      )
+
+    # Horizontal reference line
+    ref_y <- 0
+
+    # Label only the most extreme projects
+    top_improved <- cost_data %>%
+      slice_min(avg_change, n = 3)
+    top_worsened <- cost_data %>%
+      slice_max(avg_change, n = 3)
+    top_costly   <- cost_data %>%
+      slice_max(cost_millions, n = 2)
+
+    label_data <- bind_rows(
+      top_improved, top_worsened, top_costly
+    ) %>% distinct(PROJECT_NME, .keep_all = TRUE)
+
+    ggplot(cost_data, aes(x = cost_millions,
+                          y = avg_change)) +
+      # Reference line at zero
+      geom_hline(yintercept = 0, linetype = "dashed",
+                 color = COL_MUTED, linewidth = 0.6) +
+      geom_hline(yintercept =  0.5, linetype = "dotted",
+                 color = COL_RED, linewidth = 0.4, alpha = 0.5) +
+      geom_hline(yintercept = -0.5, linetype = "dotted",
+                 color = COL_GREEN, linewidth = 0.4, alpha = 0.5) +
+      # Shaded regions
+      annotate("rect",
+               xmin = -Inf, xmax = Inf,
+               ymin = -Inf, ymax = -0.5,
+               fill = COL_GREEN, alpha = 0.04) +
+      annotate("rect",
+               xmin = -Inf, xmax = Inf,
+               ymin = 0.5, ymax = Inf,
+               fill = COL_RED, alpha = 0.04) +
+      # Points
+      geom_point(aes(size = n_segments, color = dot_color),
+                 alpha = 0.75) +
+      scale_color_identity() +
+      # Labels for extreme projects
+      geom_text(data = label_data,
+                aes(label = PROJECT_NME),
+                color    = "#0d1117",
+                size     = 3.5,
+                hjust    = -0.1,
+                vjust    = 0.5,
+                check_overlap = TRUE) +
+      scale_size_continuous(range = c(3, 12),
+                            name  = "Matched Segments") +
+      scale_x_continuous(
+        labels = scales::dollar_format(suffix = "M"),
+        breaks = pretty(cost_data$cost_millions, n = 6)
+      ) +
+      # Region labels
+      annotate("text",
+               x     = max(cost_data$cost_millions) * 0.85,
+               y     = min(cost_data$avg_change) * 0.85,
+               label = "Effective",
+               color = COL_GREEN, size = 5.5,
+               fontface = "italic", alpha = 0.6) +
+      annotate("text",
+               x     = max(cost_data$cost_millions) * 0.85,
+               y     = max(cost_data$avg_change) * 0.85,
+               label = "Ineffective",
+               color = COL_RED, size = 5.5,
+               fontface = "italic", alpha = 0.6) +
+      labs(
+        title    = "Project Cost vs Safety Effectiveness",
+        subtitle = paste0(
+          if (input$cost_scope == "Statewide") "Ohio Statewide"
+          else paste0(input$cost_county, " County"),
+          " | Each point = one project | ",
+          nrow(cost_data), " projects shown"
+        ),
+        x        = "Total Project Cost",
+        y        = "Avg Crash Rate Change (per MVMT)",
+        caption  = "Negative = crash rate decreased after completion | Source: ODOT 2020–2024"
+      ) +
+      theme_odot() +
+      theme(legend.position = "right")
+  }, bg = "#0d1117")
+
+}
+
+############################################
+### RUN
+############################################
+
+shinyApp(ui = ui, server = server)
+```
